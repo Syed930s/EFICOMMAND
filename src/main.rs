@@ -1,0 +1,1600 @@
+//! EFICOMMAND - single-file CLI "bootloader" / shell for UEFI.
+//!
+//! Commands: dir cd del md rd/rmdir copy mount disk-list diskmgr echo type find start edit
+//!           help cls reboot shutdown exit
+//! Operators (work with every command): `|` pipe, `<` stdin from file, `>` / `>>` stdout to file.
+//! Quotes ("...") group arguments.
+//!
+//! Binaries (`start prog [args]`, or just type the name):
+//!   .efi  regular UEFI application (LoadImage/StartImage). Output is NOT captured by pipes.
+//!   .com  64-bit flat binary (like a DOS .COM, but x86-64). Loaded at offset 0 of an executable
+//!         buffer (+64 KiB zeroed tail), entered at byte 0 with the Microsoft x64 ABI:
+//!             RCX = *const ComApi,  return code in RAX,  RBX/RBP/RDI/RSI/R12-R15 preserved.
+//!         ComApi (all fields 8-byte slots, calls are Microsoft x64 ABI):
+//!             +0  u64  magic "EFICOM64"        +8  u32 version (1)   +12 u32 reserved
+//!             +16 *u8  args (NUL terminated)   +24 u64 args_len
+//!             +32 fn write(ptr, len)           -> stdout (honours | and >)
+//!             +40 fn getchar() -> u32          -> blocking key; special keys = 0x10000 + scancode
+//!             +48 fn read(buf, cap) -> u64     -> stdin (piped/< data, else one console line)
+//!             +56 fn stall(microseconds)
+//!
+//!   ; hello.asm   nasm -f bin hello.asm -o hello.com
+//!   bits 64
+//!       push rbx
+//!       sub  rsp, 32
+//!       mov  rbx, rcx
+//!       lea  rcx, [rel msg]
+//!       mov  edx, msglen
+//!       call [rbx + 32]
+//!       xor  eax, eax
+//!       add  rsp, 32
+//!       pop  rbx
+//!       ret
+//!   msg: db "Hello from 64-bit COM", 10
+//!   msglen equ $ - msg
+
+#![no_main]
+#![no_std]
+
+extern crate alloc;
+
+use alloc::{boxed::Box, format, string::{String, ToString}, vec, vec::Vec};
+use core::fmt::{self, Display, Write};
+use core::sync::atomic::{AtomicPtr, Ordering};
+
+use uefi::boot::{
+    self, AllocateType, LoadImageSource, MemoryType, OpenProtocolAttributes, OpenProtocolParams,
+    ScopedProtocol, SearchType,
+};
+use uefi::fs::{FileSystem, PathBuf};
+use uefi::prelude::*;
+use uefi::proto::console::text::{Color, Key, ScanCode};
+use uefi::proto::loaded_image::LoadedImage;
+use uefi::proto::media::block::BlockIO;
+use uefi::proto::media::fs::SimpleFileSystem;
+use uefi::runtime::ResetType;
+use uefi::{print, println, CString16};
+
+macro_rules! w {
+    ($w:expr, $($a:tt)*) => {{ let _ = write!($w, $($a)*); }};
+}
+macro_rules! wl {
+    ($w:expr) => {{ let _ = writeln!($w); }};
+    ($w:expr, $($a:tt)*) => {{ let _ = writeln!($w, $($a)*); }};
+}
+
+// ---------------------------------------------------------------- helpers
+
+fn es<E: Display>(e: E) -> String {
+    format!("{e}")
+}
+
+fn letter(i: usize) -> char {
+    (b'A' + i as u8) as char
+}
+
+fn human(b: u64) -> String {
+    if b >= 1 << 30 {
+        format!("{}.{:02} GiB", b >> 30, ((b & ((1 << 30) - 1)) * 100) >> 30)
+    } else if b >= 1 << 20 {
+        format!("{} MiB", b >> 20)
+    } else if b >= 1 << 10 {
+        format!("{} KiB", b >> 10)
+    } else {
+        format!("{b} B")
+    }
+}
+
+fn pb(s: &str) -> Result<PathBuf, String> {
+    let c = CString16::try_from(s).map_err(|_| "invalid path".to_string())?;
+    Ok(PathBuf::from(&*c))
+}
+
+fn le64(b: &[u8]) -> u64 {
+    u64::from_le_bytes(b[..8].try_into().unwrap())
+}
+fn le32(b: &[u8]) -> u32 {
+    u32::from_le_bytes(b[..4].try_into().unwrap())
+}
+
+fn print_bytes(b: &[u8]) {
+    let s = String::from_utf8_lossy(b);
+    let mut buf = String::new();
+    for c in s.chars() {
+        match c {
+            '\r' => {}
+            '\n' | '\t' => buf.push(c),
+            c if (c as u32) < 0x20 || (c as u32) > 0xFFFF => buf.push('.'),
+            c => buf.push(c),
+        }
+        if buf.len() > 512 {
+            print!("{}", buf);
+            buf.clear();
+        }
+    }
+    print!("{}", buf);
+}
+
+fn getkey() -> Key {
+    loop {
+        if let Some(ev) = system::with_stdin(|i| i.wait_for_key_event()) {
+            let mut evs = [ev];
+            let _ = boot::wait_for_event(&mut evs);
+        }
+        if let Ok(Some(k)) = system::with_stdin(|i| i.read_key()) {
+            return k;
+        }
+    }
+}
+
+fn read_line() -> String {
+    let mut s = String::new();
+    loop {
+        if let Key::Printable(c) = getkey() {
+            let ch = char::from(c);
+            match ch {
+                '\r' | '\n' => {
+                    println!();
+                    return s;
+                }
+                '\u{8}' => {
+                    if s.pop().is_some() {
+                        print!("\u{8} \u{8}");
+                    }
+                }
+                c if (c as u32) >= 0x20 => {
+                    s.push(c);
+                    print!("{c}");
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn cls() {
+    let _ = system::with_stdout(|o| o.clear());
+}
+
+fn hexdump<W: Write>(w: &mut W, base_off: u64, data: &[u8]) {
+    for (i, row) in data.chunks(16).enumerate() {
+        w!(w, "{:08X}  ", base_off + (i * 16) as u64);
+        for j in 0..16 {
+            if j < row.len() {
+                w!(w, "{:02X} ", row[j]);
+            } else {
+                w!(w, "   ");
+            }
+            if j == 7 {
+                w!(w, " ");
+            }
+        }
+        w!(w, " |");
+        for &b in row {
+            w!(w, "{}", if (0x20..0x7f).contains(&b) { b as char } else { '.' });
+        }
+        wl!(w, "|");
+    }
+}
+
+// ---------------------------------------------------------------- I/O plumbing (pipes / redirects)
+
+/// Per-command stdin/stdout. `direct` = write straight to the console, otherwise buffer.
+struct Io {
+    input: Vec<u8>,
+    has_input: bool,
+    pos: usize,
+    out: Vec<u8>,
+    direct: bool,
+}
+
+impl Io {
+    fn new(direct: bool) -> Self {
+        Io { input: Vec::new(), has_input: false, pos: 0, out: Vec::new(), direct }
+    }
+    fn put(&mut self, b: &[u8]) {
+        if self.direct {
+            print_bytes(b);
+        } else {
+            self.out.extend_from_slice(b);
+        }
+    }
+    fn take_input(&mut self) -> Vec<u8> {
+        let d = self.input[self.pos..].to_vec();
+        self.pos = self.input.len();
+        d
+    }
+}
+
+impl fmt::Write for Io {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.put(s.as_bytes());
+        Ok(())
+    }
+}
+
+/// Always-console writer for interactive tools.
+struct Con;
+impl fmt::Write for Con {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        print_bytes(s.as_bytes());
+        Ok(())
+    }
+}
+
+enum Tok {
+    Word(String),
+    Pipe,
+    In,
+    Out,
+    App,
+}
+
+fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
+    let mut v = Vec::new();
+    let mut cur = String::new();
+    let mut has = false;
+    let mut q = false;
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if q {
+            if c == '"' {
+                q = false;
+            } else {
+                cur.push(c);
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                q = true;
+                has = true;
+            }
+            c if c.is_whitespace() => {
+                if has {
+                    v.push(Tok::Word(core::mem::take(&mut cur)));
+                    has = false;
+                }
+            }
+            '|' | '<' | '>' => {
+                if has {
+                    v.push(Tok::Word(core::mem::take(&mut cur)));
+                    has = false;
+                }
+                v.push(match c {
+                    '|' => Tok::Pipe,
+                    '<' => Tok::In,
+                    _ => {
+                        if it.peek() == Some(&'>') {
+                            it.next();
+                            Tok::App
+                        } else {
+                            Tok::Out
+                        }
+                    }
+                });
+            }
+            _ => {
+                cur.push(c);
+                has = true;
+            }
+        }
+    }
+    if q {
+        return Err("unterminated quote".to_string());
+    }
+    if has {
+        v.push(Tok::Word(cur));
+    }
+    Ok(v)
+}
+
+#[derive(Default)]
+struct Stage {
+    args: Vec<String>,
+    infile: Option<String>,
+    outfile: Option<(String, bool)>,
+}
+
+fn next_name(it: &mut alloc::vec::IntoIter<Tok>, op: &str) -> Result<String, String> {
+    match it.next() {
+        Some(Tok::Word(w)) => Ok(w),
+        _ => Err(format!("expected a file name after {op}")),
+    }
+}
+
+fn parse(toks: Vec<Tok>) -> Result<Vec<Stage>, String> {
+    let mut stages = Vec::new();
+    let mut st = Stage::default();
+    let mut it = toks.into_iter();
+    while let Some(t) = it.next() {
+        match t {
+            Tok::Word(w) => st.args.push(w),
+            Tok::Pipe => {
+                if st.args.is_empty() {
+                    return Err("syntax error near |".to_string());
+                }
+                stages.push(core::mem::take(&mut st));
+            }
+            Tok::In => st.infile = Some(next_name(&mut it, "<")?),
+            Tok::Out => st.outfile = Some((next_name(&mut it, ">")?, false)),
+            Tok::App => st.outfile = Some((next_name(&mut it, ">>")?, true)),
+        }
+    }
+    if st.args.is_empty() {
+        if !stages.is_empty() {
+            return Err("syntax error near |".to_string());
+        }
+    } else {
+        stages.push(st);
+    }
+    Ok(stages)
+}
+
+// ---------------------------------------------------------------- block devices
+
+fn block_handles() -> Vec<Handle> {
+    boot::locate_handle_buffer(SearchType::from_proto::<BlockIO>())
+    .map(|b| b.to_vec())
+    .unwrap_or_default()
+}
+
+fn open_bio(h: Handle) -> Result<ScopedProtocol<BlockIO>, String> {
+    unsafe {
+        boot::open_protocol::<BlockIO>(
+            OpenProtocolParams { handle: h, agent: boot::image_handle(), controller: None },
+                                       OpenProtocolAttributes::GetProtocol,
+        )
+    }
+    .map_err(es)
+}
+
+fn disk_list<W: Write>(w: &mut W) {
+    let hs = block_handles();
+    if hs.is_empty() {
+        wl!(w, "no block devices");
+        return;
+    }
+    wl!(w, "{:<4} {:<6} {:>12} {:>6} {:>14}  flags", "#", "type", "size", "bs", "last lba");
+    for (i, h) in hs.iter().enumerate() {
+        match open_bio(*h) {
+            Ok(b) => {
+                let m = b.media();
+                let size = (m.last_block() + 1) * m.block_size() as u64;
+                let mut fl = String::new();
+                if m.is_removable_media() { fl.push_str("removable "); }
+                if m.is_read_only() { fl.push_str("ro "); }
+                if !m.is_media_present() { fl.push_str("no-media "); }
+                wl!(
+                    w,
+                    "{:<4} {:<6} {:>12} {:>6} {:>14}  {}",
+                    i,
+                    if m.is_logical_partition() { "part" } else { "disk" },
+                        human(size),
+                    m.block_size(),
+                    m.last_block(),
+                    fl
+                );
+            }
+            Err(e) => wl!(w, "{:<4} error: {}", i, e),
+        }
+    }
+}
+
+fn guid_name(g: &[u8]) -> &'static str {
+    const ESP: [u8; 16] = [0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B];
+    const BDP: [u8; 16] = [0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7];
+    const LNX: [u8; 16] = [0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4];
+    if g == ESP { "ESP" } else if g == BDP { "MS-Basic" } else if g == LNX { "Linux" } else { "other" }
+}
+
+fn rd_blocks(b: &mut ScopedProtocol<BlockIO>, lba: u64, count: u64) -> Result<Vec<u8>, String> {
+    let bs = b.media().block_size() as u64;
+    let id = b.media().media_id();
+    let mut buf = vec![0u8; (bs * count) as usize];
+    b.read_blocks(id, lba, &mut buf).map_err(es)?;
+    Ok(buf)
+}
+
+fn gpt_dump<W: Write>(w: &mut W, b: &mut ScopedProtocol<BlockIO>) -> Result<(), String> {
+    let bs = b.media().block_size() as u64;
+    let hdr = rd_blocks(b, 1, 1)?;
+    if &hdr[0..8] != b"EFI PART" {
+        return Err("no GPT header at LBA 1".to_string());
+    }
+    let elba = le64(&hdr[72..]);
+    let n = le32(&hdr[80..]) as u64;
+    let esz = le32(&hdr[84..]) as u64;
+    if esz < 128 || n == 0 || n > 4096 {
+        return Err("bad GPT header".to_string());
+    }
+    let blocks = (n * esz + bs - 1) / bs;
+    let ents = rd_blocks(b, elba, blocks)?;
+    wl!(w, "{:<4} {:>12} {:>12} {:>10} {:<9} name", "#", "first", "last", "size", "type");
+    for i in 0..n as usize {
+        let e = &ents[i * esz as usize..(i + 1) * esz as usize];
+        if e[0..16].iter().all(|&x| x == 0) {
+            continue;
+        }
+        let first = le64(&e[32..]);
+        let last = le64(&e[40..]);
+        let units: Vec<u16> = e[56..128]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .take_while(|&u| u != 0)
+        .collect();
+        wl!(
+            w,
+            "{:<4} {:>12} {:>12} {:>10} {:<9} {}",
+            i,
+            first,
+            last,
+            human((last - first + 1) * bs),
+            guid_name(&e[0..16]),
+            String::from_utf16_lossy(&units)
+        );
+    }
+    Ok(())
+}
+
+fn diskmgr() {
+    println!("diskmgr - type 'help' for commands, 'exit' to leave");
+    loop {
+        print!("diskmgr> ");
+        let line = read_line();
+        let a: Vec<&str> = line.split_whitespace().collect();
+        if a.is_empty() {
+            continue;
+        }
+        let hs = block_handles();
+        let pick = |i: usize| -> Result<ScopedProtocol<BlockIO>, String> {
+            let n: usize = a.get(i).ok_or("missing disk #")?.parse().map_err(|_| "bad disk #")?;
+            open_bio(*hs.get(n).ok_or("no such disk")?)
+        };
+        let num = |i: usize| -> Result<u64, String> {
+            a.get(i).ok_or("missing argument")?.parse::<u64>().map_err(|_| "bad number".to_string())
+        };
+        let r: Result<(), String> = (|| match a[0].to_ascii_lowercase().as_str() {
+            "exit" | "quit" | "q" => Err("\0".to_string()),
+                                     "help" | "?" => {
+                                         println!("list                     list block devices");
+                                         println!("info <d>                 media details");
+                                         println!("gpt <d>                  dump GPT partitions");
+                                         println!("read <d> <lba> [n]       hexdump n blocks (default 1, max 8)");
+                                         println!("zero <d> <lba> <n>       write n zeroed blocks");
+                                         println!("exit");
+                                         Ok(())
+                                     }
+                                     "list" => { disk_list(&mut Con); Ok(()) }
+                                     "info" => {
+                                         let b = pick(1)?;
+                                         let m = b.media();
+                                         println!("media id      : {}", m.media_id());
+                                         println!("block size    : {}", m.block_size());
+                                         println!("last block    : {}", m.last_block());
+                                         println!("size          : {}", human((m.last_block() + 1) * m.block_size() as u64));
+                                         println!("io align      : {}", m.io_align());
+                                         println!("removable     : {}", m.is_removable_media());
+                                         println!("present       : {}", m.is_media_present());
+                                         println!("logical part  : {}", m.is_logical_partition());
+                                         println!("read only     : {}", m.is_read_only());
+                                         Ok(())
+                                     }
+                                     "gpt" => { let mut b = pick(1)?; gpt_dump(&mut Con, &mut b) }
+                                     "read" => {
+                                         let mut b = pick(1)?;
+                                         let lba = num(2)?;
+                                         let n = if a.len() > 3 { num(3)?.clamp(1, 8) } else { 1 };
+                                         let bs = b.media().block_size() as u64;
+                                         let buf = rd_blocks(&mut b, lba, n)?;
+                                         hexdump(&mut Con, lba * bs, &buf);
+                                         Ok(())
+                                     }
+                                     "zero" => {
+                                         let mut b = pick(1)?;
+                                         let lba = num(2)?;
+                                         let n = num(3)?;
+                                         if b.media().is_read_only() {
+                                             return Err("media is read-only".to_string());
+                                         }
+                                         let bs = b.media().block_size() as u64;
+                                         let id = b.media().media_id();
+                                         let chunk = core::cmp::max(1, (1u64 << 20) / bs);
+                                         let zeros = vec![0u8; (chunk * bs) as usize];
+                                         let mut done = 0u64;
+                                         while done < n {
+                                             let c = core::cmp::min(chunk, n - done);
+                                             b.write_blocks(id, lba + done, &zeros[..(c * bs) as usize]).map_err(es)?;
+                                             done += c;
+                                         }
+                                         b.flush_blocks().map_err(es)?;
+                                         println!("zeroed {n} blocks @ {lba}");
+                                         Ok(())
+                                     }
+                                     _ => Err("unknown command".to_string()),
+        })();
+        if let Err(e) = r {
+            if e == "\0" {
+                return;
+            }
+            println!("error: {e}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 64-bit .COM / .EFI loader
+
+#[repr(C)]
+struct ComApi {
+    magic: u64,
+    version: u32,
+    reserved: u32,
+    args: *const u8,
+    args_len: u64,
+    write: extern "efiapi" fn(*const u8, u64),
+    getchar: extern "efiapi" fn() -> u32,
+    read: extern "efiapi" fn(*mut u8, u64) -> u64,
+    stall: extern "efiapi" fn(u64),
+}
+
+static CUR_IO: AtomicPtr<Io> = AtomicPtr::new(core::ptr::null_mut());
+
+extern "efiapi" fn com_write(p: *const u8, n: u64) {
+    let io = CUR_IO.load(Ordering::SeqCst);
+    if io.is_null() || p.is_null() {
+        return;
+    }
+    unsafe { (*io).put(core::slice::from_raw_parts(p, n as usize)) };
+}
+
+extern "efiapi" fn com_getchar() -> u32 {
+    match getkey() {
+        Key::Printable(c) => u32::from(u16::from(c)),
+        Key::Special(s) => 0x1_0000 + s.0 as u32,
+    }
+}
+
+extern "efiapi" fn com_read(buf: *mut u8, cap: u64) -> u64 {
+    let io = CUR_IO.load(Ordering::SeqCst);
+    if io.is_null() || buf.is_null() {
+        return 0;
+    }
+    unsafe {
+        let io = &mut *io;
+        let dst = core::slice::from_raw_parts_mut(buf, cap as usize);
+        let data: Vec<u8> = if io.has_input {
+            let rem = &io.input[io.pos..];
+            let n = core::cmp::min(rem.len(), dst.len());
+            let d = rem[..n].to_vec();
+            io.pos += n;
+            d
+        } else {
+            let mut b = read_line().into_bytes();
+            b.push(b'\n');
+            b
+        };
+        let n = core::cmp::min(data.len(), dst.len());
+        dst[..n].copy_from_slice(&data[..n]);
+        n as u64
+    }
+}
+
+extern "efiapi" fn com_stall(us: u64) {
+    boot::stall(us as usize);
+}
+
+fn run_com(data: &[u8], args: &str, io: &mut Io) -> Result<u64, String> {
+    if data.is_empty() {
+        return Err("empty file".to_string());
+    }
+    let pages = (data.len() + 0x10000 + 4095) / 4096;
+    let mem = boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_CODE, pages).map_err(es)?;
+    unsafe {
+        core::ptr::write_bytes(mem.as_ptr(), 0, pages * 4096);
+        core::ptr::copy_nonoverlapping(data.as_ptr(), mem.as_ptr(), data.len());
+    }
+    let mut argv = args.as_bytes().to_vec();
+    argv.push(0);
+    let api = ComApi {
+        magic: u64::from_le_bytes(*b"EFICOM64"),
+        version: 1,
+        reserved: 0,
+        args: argv.as_ptr(),
+        args_len: (argv.len() - 1) as u64,
+        write: com_write,
+        getchar: com_getchar,
+        read: com_read,
+        stall: com_stall,
+    };
+    CUR_IO.store(io as *mut Io, Ordering::SeqCst);
+    let entry: extern "efiapi" fn(*const ComApi) -> u64 = unsafe { core::mem::transmute(mem.as_ptr()) };
+    let rc = entry(&api);
+    CUR_IO.store(core::ptr::null_mut(), Ordering::SeqCst);
+    unsafe {
+        let _ = boot::free_pages(mem, pages);
+    }
+    Ok(rc)
+}
+
+fn run_efi(data: &[u8], cmdline: &str) -> Result<u64, String> {
+    let h = boot::load_image(
+        boot::image_handle(),
+                             LoadImageSource::FromBuffer { buffer: data, file_path: None },
+    )
+    .map_err(es)?;
+    if !cmdline.is_empty() {
+        if let Ok(c) = CString16::try_from(cmdline) {
+            let c = Box::leak(Box::new(c));
+            let mut li = boot::open_protocol_exclusive::<LoadedImage>(h).map_err(es)?;
+            unsafe { li.set_load_options(c.as_ptr() as *const u8, c.num_bytes() as u32) };
+        }
+    }
+    match boot::start_image(h) {
+        Ok(()) => Ok(0),
+        Err(e) => Err(format!("image exited: {:?}", e.status())),
+    }
+}
+
+// ---------------------------------------------------------------- built-in editor (nano-like)
+
+fn term_size() -> (usize, usize) {
+    system::with_stdout(|o| o.current_mode().ok().flatten().map(|m| (m.columns(), m.rows())))
+    .unwrap_or((80, 25))
+}
+
+fn put_row(row: usize, s: &str, width: usize, inv: bool) {
+    let mut t: String = s
+    .chars()
+    .take(width)
+    .map(|c| if (c as u32) < 0x20 || (c as u32) > 0xFFFF || c == '\u{7f}' { ' ' } else { c })
+    .collect();
+    while t.chars().count() < width {
+        t.push(' ');
+    }
+    if let Ok(c) = CString16::try_from(t.as_str()) {
+        system::with_stdout(|o| {
+            if inv {
+                let _ = o.set_color(Color::Black, Color::LightGray);
+            }
+            let _ = o.set_cursor_position(0, row);
+            let _ = o.output_string(&c);
+            if inv {
+                let _ = o.set_color(Color::LightGray, Color::Black);
+            }
+        });
+    }
+}
+
+struct Editor<'a> {
+    sh: &'a Shell,
+    lines: Vec<Vec<char>>,
+    cy: usize,
+    cx: usize,
+    top: usize,
+    left: usize,
+    drive: usize,
+    path: String,
+    modified: bool,
+    crlf: bool,
+    cutbuf: Vec<Vec<char>>,
+    last_cut: bool,
+    msg: String,
+    last_search: String,
+}
+
+impl<'a> Editor<'a> {
+    fn bytes(&self) -> Vec<u8> {
+        let nl = if self.crlf { "\r\n" } else { "\n" };
+        let mut s = String::new();
+        if !(self.lines.len() == 1 && self.lines[0].is_empty()) {
+            for l in &self.lines {
+                s.extend(l.iter());
+                s.push_str(nl);
+            }
+        }
+        s.into_bytes()
+    }
+
+    fn text_h(rows: usize) -> usize {
+        rows.saturating_sub(3).max(1)
+    }
+
+    fn draw(&mut self) {
+        let (cols, rows) = term_size();
+        let th = Self::text_h(rows);
+        if self.cy < self.top {
+            self.top = self.cy;
+        }
+        if self.cy >= self.top + th {
+            self.top = self.cy + 1 - th;
+        }
+        if self.cx < self.left {
+            self.left = self.cx;
+        }
+        if self.cx >= self.left + cols {
+            self.left = self.cx + 1 - cols;
+        }
+        let _ = system::with_stdout(|o| o.enable_cursor(false));
+        let name = if self.path.is_empty() { "New Buffer" } else { self.path.as_str() };
+        let title = format!(
+            " EFIEDIT 0.1   {}{}   Ln {}/{} Col {}",
+            name,
+            if self.modified { " (modified)" } else { "" },
+                self.cy + 1,
+                self.lines.len(),
+                            self.cx + 1
+        );
+        put_row(0, &title, cols, true);
+        for r in 0..th {
+            let li = self.top + r;
+            let s: String = if li < self.lines.len() {
+                self.lines[li].iter().skip(self.left).take(cols).collect()
+            } else {
+                String::new()
+            };
+            put_row(1 + r, &s, cols, false);
+        }
+        let m = if self.msg.is_empty() { String::new() } else { format!(" [ {} ]", self.msg) };
+        put_row(th + 1, &m, cols, false);
+        put_row(
+            th + 2,
+            " ^G Help  ^O Save  ^X Exit  ^W Search  ^K Cut  ^U Paste  ^A/^E Home/End  F2 Save  F10 Exit",
+            cols.saturating_sub(1),
+                true,
+        );
+        let _ = system::with_stdout(|o| {
+            let _ = o.set_cursor_position(self.cx - self.left, 1 + self.cy - self.top);
+            o.enable_cursor(true)
+        });
+    }
+
+    fn prompt(&mut self, label: &str, default: &str) -> Option<String> {
+        let mut s: Vec<char> = default.chars().collect();
+        loop {
+            let (cols, rows) = term_size();
+            let row = rows.saturating_sub(2);
+            let line = format!("{label}: {}", s.iter().collect::<String>());
+            put_row(row, &line, cols, false);
+            let cx = core::cmp::min(line.chars().count(), cols.saturating_sub(1));
+            let _ = system::with_stdout(|o| {
+                let _ = o.set_cursor_position(cx, row);
+                o.enable_cursor(true)
+            });
+            match getkey() {
+                Key::Printable(c) => {
+                    let ch = char::from(c);
+                    match ch as u32 {
+                        0x0D => return Some(s.iter().collect()),
+                        0x08 => {
+                            s.pop();
+                        }
+                        0x03 => return None,
+                        x if x >= 0x20 => s.push(ch),
+                        _ => {}
+                    }
+                }
+                Key::Special(ScanCode::ESCAPE) => return None,
+                _ => {}
+            }
+        }
+    }
+
+    fn save(&mut self) -> bool {
+        let default = self.path.clone();
+        let name = match self.prompt("File Name to Write", &default) {
+            Some(n) if !n.trim().is_empty() => n,
+            _ => {
+                self.msg = "Cancelled".to_string();
+                return false;
+            }
+        };
+        let (d, p) = self.sh.resolve(name.trim());
+        let data = self.bytes();
+        let r = self.sh.with_fs(d, |fs| fs.write(pb(&p)?, &data).map_err(es));
+        match r {
+            Ok(()) => {
+                self.drive = d;
+                self.path = format!("{}:{}", letter(d), p);
+                self.modified = false;
+                self.msg = format!("Wrote {} lines", self.lines.len());
+                true
+            }
+            Err(e) => {
+                self.msg = format!("Error: {e}");
+                false
+            }
+        }
+    }
+
+    fn help(&mut self) {
+        let (cols, rows) = term_size();
+        let th = Self::text_h(rows);
+        let text = [
+            "EFIEDIT help",
+            "",
+            "^O / F2    Write out (save)         ^X / F10   Exit",
+            "^W         Search forward           ^K         Cut line(s)",
+            "^U         Paste cut line(s)        ^G / F1    This help",
+            "^A / Home  Start of line            ^E / End   End of line",
+            "^Y / PgUp  Page up                  ^V / PgDn  Page down",
+            "Arrows move, Backspace/Delete edit, Tab inserts 4 spaces",
+            "In prompts: Enter accepts, Esc / ^C cancels",
+            "",
+            "Press any key to return",
+        ];
+        for r in 0..th {
+            put_row(1 + r, text.get(r).copied().unwrap_or(""), cols, false);
+        }
+        let _ = getkey();
+    }
+
+    fn search(&mut self) {
+        let default = self.last_search.clone();
+        let q = match self.prompt("Search", &default) {
+            Some(q) if !q.is_empty() => q,
+            _ => return,
+        };
+        self.last_search = q.clone();
+        let needle: Vec<char> = q.chars().collect();
+        let n = self.lines.len();
+        for k in 0..=n {
+            let li = (self.cy + k) % n;
+            let start = if k == 0 { self.cx + 1 } else { 0 };
+            let line = &self.lines[li];
+            if line.len() >= needle.len() {
+                for x in start..=(line.len() - needle.len()) {
+                    if line[x..x + needle.len()] == needle[..] {
+                        self.cy = li;
+                        self.cx = x;
+                        self.msg.clear();
+                        return;
+                    }
+                }
+            }
+        }
+        self.msg = format!("\"{q}\" not found");
+    }
+
+    fn clamp_x(&mut self) {
+        let l = self.lines[self.cy].len();
+        if self.cx > l {
+            self.cx = l;
+        }
+    }
+
+    fn run(&mut self) {
+        loop {
+            self.draw();
+            let was_cut = self.last_cut;
+            self.last_cut = false;
+            let (_, rows) = term_size();
+            let th = Self::text_h(rows);
+            match getkey() {
+                Key::Printable(c) => {
+                    let ch = char::from(c);
+                    self.msg.clear();
+                    match ch as u32 {
+                        0x0D => {
+                            let rest = self.lines[self.cy].split_off(self.cx);
+                            self.cy += 1;
+                            self.lines.insert(self.cy, rest);
+                            self.cx = 0;
+                            self.modified = true;
+                        }
+                        0x08 => {
+                            if self.cx > 0 {
+                                self.lines[self.cy].remove(self.cx - 1);
+                                self.cx -= 1;
+                                self.modified = true;
+                            } else if self.cy > 0 {
+                                let cur = self.lines.remove(self.cy);
+                                self.cy -= 1;
+                                self.cx = self.lines[self.cy].len();
+                                self.lines[self.cy].extend(cur);
+                                self.modified = true;
+                            }
+                        }
+                        0x09 => {
+                            for _ in 0..4 {
+                                self.lines[self.cy].insert(self.cx, ' ');
+                                self.cx += 1;
+                            }
+                            self.modified = true;
+                        }
+                        0x01 => self.cx = 0,
+                        0x05 => self.cx = self.lines[self.cy].len(),
+                        0x07 => self.help(),
+                        0x0F => {
+                            self.save();
+                        }
+                        0x17 => self.search(),
+                        0x0B => {
+                            if !was_cut {
+                                self.cutbuf.clear();
+                            }
+                            let l = self.lines.remove(self.cy);
+                            self.cutbuf.push(l);
+                            if self.lines.is_empty() {
+                                self.lines.push(Vec::new());
+                            }
+                            if self.cy >= self.lines.len() {
+                                self.cy = self.lines.len() - 1;
+                            }
+                            self.cx = 0;
+                            self.modified = true;
+                            self.last_cut = true;
+                        }
+                        0x15 => {
+                            if !self.cutbuf.is_empty() {
+                                for (i, l) in self.cutbuf.clone().into_iter().enumerate() {
+                                    self.lines.insert(self.cy + i, l);
+                                }
+                                self.cy += self.cutbuf.len();
+                                self.cx = 0;
+                                self.modified = true;
+                            }
+                        }
+                        0x19 => {
+                            self.cy = self.cy.saturating_sub(th);
+                            self.clamp_x();
+                        }
+                        0x16 => {
+                            self.cy = core::cmp::min(self.cy + th, self.lines.len() - 1);
+                            self.clamp_x();
+                        }
+                        0x18 => {
+                            if self.try_exit() {
+                                return;
+                            }
+                        }
+                        0x20..=0x7E | 0xA0..=0xFFFF => {
+                            self.lines[self.cy].insert(self.cx, ch);
+                            self.cx += 1;
+                            self.modified = true;
+                        }
+                        _ => {}
+                    }
+                }
+                Key::Special(s) => {
+                    self.msg.clear();
+                    match s {
+                        ScanCode::UP => {
+                            if self.cy > 0 {
+                                self.cy -= 1;
+                                self.clamp_x();
+                            }
+                        }
+                        ScanCode::DOWN => {
+                            if self.cy + 1 < self.lines.len() {
+                                self.cy += 1;
+                                self.clamp_x();
+                            }
+                        }
+                        ScanCode::LEFT => {
+                            if self.cx > 0 {
+                                self.cx -= 1;
+                            } else if self.cy > 0 {
+                                self.cy -= 1;
+                                self.cx = self.lines[self.cy].len();
+                            }
+                        }
+                        ScanCode::RIGHT => {
+                            if self.cx < self.lines[self.cy].len() {
+                                self.cx += 1;
+                            } else if self.cy + 1 < self.lines.len() {
+                                self.cy += 1;
+                                self.cx = 0;
+                            }
+                        }
+                        ScanCode::HOME => self.cx = 0,
+                        ScanCode::END => self.cx = self.lines[self.cy].len(),
+                        ScanCode::PAGE_UP => {
+                            self.cy = self.cy.saturating_sub(th);
+                            self.clamp_x();
+                        }
+                        ScanCode::PAGE_DOWN => {
+                            self.cy = core::cmp::min(self.cy + th, self.lines.len() - 1);
+                            self.clamp_x();
+                        }
+                        ScanCode::DELETE => {
+                            if self.cx < self.lines[self.cy].len() {
+                                self.lines[self.cy].remove(self.cx);
+                                self.modified = true;
+                            } else if self.cy + 1 < self.lines.len() {
+                                let nxt = self.lines.remove(self.cy + 1);
+                                self.lines[self.cy].extend(nxt);
+                                self.modified = true;
+                            }
+                        }
+                        ScanCode::FUNCTION_1 => self.help(),
+                        ScanCode::FUNCTION_2 => {
+                            self.save();
+                        }
+                        ScanCode::FUNCTION_10 => {
+                            if self.try_exit() {
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// true = leave the editor
+    fn try_exit(&mut self) -> bool {
+        if !self.modified {
+            return true;
+        }
+        let (cols, rows) = term_size();
+        put_row(rows.saturating_sub(2), " Save modified buffer? (Y = yes, N = discard, Esc = cancel)", cols, false);
+        loop {
+            match getkey() {
+                Key::Printable(c) => match char::from(c).to_ascii_lowercase() {
+                    'y' => return self.save(),
+                    'n' => return true,
+                    _ => {}
+                },
+                Key::Special(ScanCode::ESCAPE) => {
+                    self.msg = "Cancelled".to_string();
+                    return false;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn edit(sh: &Shell, arg: Option<&str>) -> Result<(), String> {
+    let (drive, path) = match arg {
+        Some(a) if !a.is_empty() => {
+            let (d, p) = sh.resolve(a);
+            (d, format!("{}:{}", letter(d), p))
+        }
+        _ => (sh.cur, String::new()),
+    };
+    let mut lines: Vec<Vec<char>> = vec![Vec::new()];
+    let mut crlf = false;
+    let mut msg = String::from("New buffer");
+    if !path.is_empty() {
+        let (d, p) = sh.resolve(&path);
+        let r = sh.with_fs(d, |fs| {
+            let pp = pb(&p)?;
+            if fs.try_exists(pp.clone()).map_err(es)? {
+                fs.read(pp).map(Some).map_err(es)
+            } else {
+                Ok(None)
+            }
+        })?;
+        match r {
+            Some(data) => {
+                let text = String::from_utf8_lossy(&data);
+                crlf = text.contains("\r\n");
+                let mut v: Vec<Vec<char>> =
+                text.split('\n').map(|l| l.trim_end_matches('\r').chars().collect()).collect();
+                if v.len() > 1 && v.last().map_or(false, |l| l.is_empty()) {
+                    v.pop();
+                }
+                msg = format!("Read {} lines", v.len());
+                lines = v;
+            }
+            None => msg = "New file".to_string(),
+        }
+    }
+    let mut ed = Editor {
+        sh,
+        lines,
+        cy: 0,
+        cx: 0,
+        top: 0,
+        left: 0,
+        drive,
+        path,
+        modified: false,
+        crlf,
+        cutbuf: Vec::new(),
+        last_cut: false,
+        msg,
+        last_search: String::new(),
+    };
+    let _ = ed.drive;
+    cls();
+    ed.run();
+    let _ = system::with_stdout(|o| {
+        let _ = o.set_color(Color::LightGray, Color::Black);
+        let _ = o.clear();
+        o.enable_cursor(true)
+    });
+    Ok(())
+}
+
+// ---------------------------------------------------------------- shell
+
+struct Shell {
+    vols: Vec<Handle>,
+    map: [Option<usize>; 26],
+    cwd: [String; 26],
+    cur: usize,
+    quit: bool,
+}
+
+impl Shell {
+    fn new() -> Self {
+        let mut s = Shell {
+            vols: Vec::new(),
+            map: [None; 26],
+            cwd: core::array::from_fn(|_| String::from("\\")),
+            cur: 23,
+            quit: false,
+        };
+        s.scan();
+        s
+    }
+
+    /// Enumerate filesystems. Boot volume -> X:, the rest -> C:, D:, ...
+    fn scan(&mut self) {
+        self.vols = boot::locate_handle_buffer(SearchType::from_proto::<SimpleFileSystem>())
+        .map(|b| b.to_vec())
+        .unwrap_or_default();
+        let boot_dev = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle())
+        .ok()
+        .and_then(|li| li.device());
+        self.map = [None; 26];
+        let mut next = 2usize;
+        for (i, h) in self.vols.iter().enumerate() {
+            if Some(*h) == boot_dev && self.map[23].is_none() {
+                self.map[23] = Some(i);
+                continue;
+            }
+            while next < 26 && (next == 23 || self.map[next].is_some()) {
+                next += 1;
+            }
+            if next < 26 {
+                self.map[next] = Some(i);
+                next += 1;
+            }
+        }
+        if self.map[self.cur].is_none() {
+            self.cur = (0..26).find(|&i| self.map[i].is_some()).unwrap_or(23);
+        }
+    }
+
+    fn with_fs<T>(&self, drv: usize, f: impl FnOnce(&mut FileSystem) -> Result<T, String>) -> Result<T, String> {
+        let vi = self.map[drv].ok_or_else(|| format!("drive {}: not mounted", letter(drv)))?;
+        let sfs = boot::open_protocol_exclusive::<SimpleFileSystem>(self.vols[vi]).map_err(es)?;
+        let mut fs = FileSystem::new(sfs);
+        f(&mut fs)
+    }
+
+    fn resolve(&self, arg: &str) -> (usize, String) {
+        let b = arg.as_bytes();
+        let (drv, rest) = if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+            ((b[0].to_ascii_uppercase() - b'A') as usize, &arg[2..])
+        } else {
+            (self.cur, arg)
+        };
+        let mut parts: Vec<&str> = if rest.starts_with('\\') || rest.starts_with('/') {
+            Vec::new()
+        } else {
+            self.cwd[drv].split('\\').filter(|s| !s.is_empty()).collect()
+        };
+        for p in rest.split(|c| c == '\\' || c == '/') {
+            match p {
+                "" | "." => {}
+                ".." => { parts.pop(); }
+                x => parts.push(x),
+            }
+        }
+        let mut s = String::from("\\");
+        s.push_str(&parts.join("\\"));
+        (drv, s)
+    }
+
+    fn prompt(&self) -> String {
+        format!("{}:{}> ", letter(self.cur), self.cwd[self.cur])
+    }
+
+    fn is_dir(fs: &mut FileSystem, p: &str) -> bool {
+        if p == "\\" {
+            return true;
+        }
+        match pb(p) {
+            Ok(pp) => fs.metadata(pp).map(|m| m.is_directory()).unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    fn is_file(fs: &mut FileSystem, p: &str) -> bool {
+        match pb(p) {
+            Ok(pp) => fs.metadata(pp).map(|m| !m.is_directory()).unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    fn read_file(&self, p: &str) -> Result<Vec<u8>, String> {
+        let (d, pp) = self.resolve(p);
+        self.with_fs(d, |fs| fs.read(pb(&pp)?).map_err(es))
+    }
+
+    fn write_file(&self, p: &str, data: &[u8], append: bool) -> Result<(), String> {
+        let (d, pp) = self.resolve(p);
+        self.with_fs(d, |fs| {
+            let path = pb(&pp)?;
+            if append {
+                let mut old = fs.read(path.clone()).unwrap_or_default();
+                old.extend_from_slice(data);
+                fs.write(path, old).map_err(es)
+            } else {
+                fs.write(path, data).map_err(es)
+            }
+        })
+    }
+
+    fn dir(&self, arg: &str, io: &mut Io) -> Result<(), String> {
+        let (d, p) = self.resolve(arg);
+        let ents = self.with_fs(d, |fs| {
+            let it = fs.read_dir(pb(&p)?).map_err(es)?;
+            let mut v = Vec::new();
+            for e in it {
+                v.push(e.map_err(es)?);
+            }
+            Ok(v)
+        })?;
+        wl!(io, " Directory of {}:{}\n", letter(d), p);
+        let (mut nf, mut nd, mut bytes) = (0u32, 0u32, 0u64);
+        for e in &ents {
+            let name = format!("{}", e.file_name());
+            if name == "." || name == ".." {
+                continue;
+            }
+            let t = e.modification_time();
+            let isd = e.is_directory();
+            wl!(
+                io,
+                "{:04}-{:02}-{:02} {:02}:{:02}  {:>5} {:>12}  {}",
+                t.year(), t.month(), t.day(), t.hour(), t.minute(),
+                if isd { "<DIR>" } else { "" },
+                    if isd { String::new() } else { e.file_size().to_string() },
+                        name
+            );
+            if isd { nd += 1 } else { nf += 1; bytes += e.file_size() }
+        }
+        wl!(io, "\n {nf} file(s) {bytes} bytes, {nd} dir(s)");
+        Ok(())
+    }
+
+    fn cd(&mut self, arg: &str, io: &mut Io) -> Result<(), String> {
+        if arg.is_empty() {
+            wl!(io, "{}:{}", letter(self.cur), self.cwd[self.cur]);
+            return Ok(());
+        }
+        let (d, p) = self.resolve(arg);
+        let ok = self.with_fs(d, |fs| Ok(Self::is_dir(fs, &p)))?;
+        if !ok {
+            return Err("path not found or not a directory".to_string());
+        }
+        self.cwd[d] = p;
+        Ok(())
+    }
+
+    fn del(&self, rest: &[String]) -> Result<(), String> {
+        if rest.is_empty() {
+            return Err("usage: del <file> [file...]".to_string());
+        }
+        for f in rest {
+            let (d, p) = self.resolve(f);
+            self.with_fs(d, |fs| fs.remove_file(pb(&p)?).map_err(es))?;
+        }
+        Ok(())
+    }
+
+    fn md(&self, arg: &str) -> Result<(), String> {
+        if arg.is_empty() { return Err("usage: md <dir>".to_string()); }
+        let (d, p) = self.resolve(arg);
+        self.with_fs(d, |fs| fs.create_dir(pb(&p)?).map_err(es))
+    }
+
+    fn rd(&self, rest: &[String]) -> Result<(), String> {
+        let mut recursive = false;
+        let mut target = "";
+        for a in rest {
+            if a.eq_ignore_ascii_case("/s") { recursive = true } else { target = a }
+        }
+        if target.is_empty() { return Err("usage: rd [/s] <dir>".to_string()); }
+        let (d, p) = self.resolve(target);
+        if p == "\\" { return Err("refusing to remove root".to_string()); }
+        self.with_fs(d, |fs| {
+            let pp = pb(&p)?;
+            if recursive { fs.remove_dir_all(pp).map_err(es) } else { fs.remove_dir(pp).map_err(es) }
+        })
+    }
+
+    fn copy(&self, rest: &[String], io: &mut Io) -> Result<(), String> {
+        if rest.len() != 2 { return Err("usage: copy <src> <dst>".to_string()); }
+        let (sd, sp) = self.resolve(&rest[0]);
+        let (dd, mut dp) = self.resolve(&rest[1]);
+        let data = self.with_fs(sd, |fs| fs.read(pb(&sp)?).map_err(es))?;
+        let name = sp.rsplit('\\').next().unwrap_or("").to_string();
+        let dst_is_dir = self.with_fs(dd, |fs| Ok(Self::is_dir(fs, &dp)))?;
+        if dst_is_dir {
+            if !dp.ends_with('\\') { dp.push('\\'); }
+            dp.push_str(&name);
+        }
+        let n = data.len();
+        self.with_fs(dd, |fs| fs.write(pb(&dp)?, data).map_err(es))?;
+        wl!(io, "copied {n} bytes -> {}:{}", letter(dd), dp);
+        Ok(())
+    }
+
+    fn mount(&mut self, rest: &[String], io: &mut Io) -> Result<(), String> {
+        let a: Vec<&str> = rest.iter().map(|s| s.as_str()).collect();
+        match a.as_slice() {
+            [] => {
+                self.scan();
+                if self.vols.is_empty() { wl!(io, "no filesystems found"); }
+                for i in 0..26 {
+                    if let Some(v) = self.map[i] {
+                        wl!(io, "{}:  fs{}{}", letter(i), v, if i == 23 { "  (boot)" } else { "" });
+                    }
+                }
+                Ok(())
+            }
+            ["-d", l] => {
+                let i = Self::drv(l)?;
+                self.map[i] = None;
+                Ok(())
+            }
+            [fs, l] => {
+                let v: usize = fs.trim_start_matches("fs").parse().map_err(|_| "usage: mount fsN L:")?;
+                if v >= self.vols.len() { return Err("no such filesystem".to_string()); }
+                let i = Self::drv(l)?;
+                for m in self.map.iter_mut() {
+                    if *m == Some(v) { *m = None; }
+                }
+                self.map[i] = Some(v);
+                Ok(())
+            }
+            _ => Err("usage: mount | mount fsN L: | mount -d L:".to_string()),
+        }
+    }
+
+    fn drv(s: &str) -> Result<usize, String> {
+        let b = s.as_bytes();
+        if !b.is_empty() && b[0].is_ascii_alphabetic() { Ok((b[0].to_ascii_uppercase() - b'A') as usize) } else { Err("bad drive letter".to_string()) }
+    }
+
+    fn type_cmd(&self, rest: &[String], io: &mut Io) -> Result<(), String> {
+        let mut last_nl = true;
+        if rest.is_empty() {
+            if !io.has_input {
+                return Err("usage: type <file> [file...]".to_string());
+            }
+            let d = io.take_input();
+            last_nl = d.last().map_or(true, |&b| b == b'\n');
+            io.put(&d);
+        } else {
+            for f in rest {
+                let d = self.read_file(f).map_err(|e| format!("{f}: {e}"))?;
+                last_nl = d.last().map_or(true, |&b| b == b'\n');
+                io.put(&d);
+            }
+        }
+        if io.direct && !last_nl {
+            io.put(b"\n");
+        }
+        Ok(())
+    }
+
+    fn find(&self, rest: &[String], io: &mut Io) -> Result<(), String> {
+        let (mut ci, mut inv) = (false, false);
+        let mut pat: Option<&String> = None;
+        let mut files: Vec<&String> = Vec::new();
+        for a in rest {
+            match a.to_ascii_lowercase().as_str() {
+                "/i" => ci = true,
+                "/v" => inv = true,
+                _ => {
+                    if pat.is_none() { pat = Some(a) } else { files.push(a) }
+                }
+            }
+        }
+        let pat = pat.ok_or("usage: find [/i] [/v] <text> [files]")?;
+        let needle = if ci { pat.to_lowercase() } else { pat.clone() };
+        let mut srcs: Vec<Vec<u8>> = Vec::new();
+        if files.is_empty() {
+            srcs.push(io.take_input());
+        } else {
+            for f in &files {
+                srcs.push(self.read_file(f).map_err(|e| format!("{f}: {e}"))?);
+            }
+        }
+        for d in srcs {
+            let t = String::from_utf8_lossy(&d);
+            for line in t.lines() {
+                let hay = if ci { line.to_lowercase() } else { line.to_string() };
+                if hay.contains(needle.as_str()) != inv {
+                    wl!(io, "{line}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Find a runnable binary: exact name, then name.com / name.efi; cwd first, then X:\.
+    fn locate(&self, name: &str) -> Option<(usize, String)> {
+        let (d, p) = self.resolve(name);
+        let last = name.rsplit(|c| c == '\\' || c == '/').next().unwrap_or("");
+        let has_ext = last.contains('.');
+        let mut cands: Vec<(usize, String)> = Vec::new();
+        let mut add = |d: usize, p: String| {
+            if has_ext {
+                cands.push((d, p));
+            } else {
+                cands.push((d, format!("{p}.com")));
+                cands.push((d, format!("{p}.efi")));
+            }
+        };
+        add(d, p);
+        if !name.contains(':') && !name.contains('\\') && !name.contains('/') && d != 23 {
+            add(23, format!("\\{name}"));
+        }
+        for (d, p) in cands {
+            if self.with_fs(d, |fs| Ok(Self::is_file(fs, &p))).unwrap_or(false) {
+                return Some((d, p));
+            }
+        }
+        None
+    }
+
+    fn start(&self, a: &[String], io: &mut Io) -> Result<(), String> {
+        let name = a.first().ok_or("usage: start <file.com|file.efi> [args]")?;
+        let (d, p) = self.locate(name).ok_or_else(|| format!("{name}: not found"))?;
+        let data = self.with_fs(d, |fs| fs.read(pb(&p)?).map_err(es))?;
+        let ext = p.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+        let rc = match ext.as_str() {
+            "com" => run_com(&data, &a[1..].join(" "), io)?,
+            "efi" => run_efi(&data, &a.join(" "))?,
+            _ => return Err("unsupported binary type (use .com or .efi)".to_string()),
+        };
+        if rc != 0 {
+            println!("[exit {rc}]");
+        }
+        Ok(())
+    }
+
+    fn exec(&mut self, a: &[String], io: &mut Io) -> Result<(), String> {
+        let cmd = a[0].to_ascii_lowercase();
+        let rest = &a[1..];
+        let arg0 = rest.first().map(|s| s.as_str()).unwrap_or("");
+        // drive switch "D:"
+        if cmd.len() == 2 && cmd.ends_with(':') && rest.is_empty() {
+            return match Self::drv(&cmd) {
+                Ok(i) if self.map[i].is_some() => {
+                    self.cur = i;
+                    Ok(())
+                }
+                _ => Err("drive not available".to_string()),
+            };
+        }
+        match cmd.as_str() {
+            "dir" | "ls" => self.dir(arg0, io),
+            "cd" | "chdir" => self.cd(&rest.join(" "), io),
+            "del" | "rm" | "erase" => self.del(rest),
+            "md" | "mkdir" => self.md(arg0),
+            "rd" | "rmdir" => self.rd(rest),
+            "copy" | "cp" => self.copy(rest, io),
+            "mount" => self.mount(rest, io),
+            "disk-list" => { disk_list(io); Ok(()) }
+            "diskmgr" => { diskmgr(); Ok(()) }
+            "echo" => {
+                wl!(io, "{}", rest.join(" "));
+                Ok(())
+            }
+            "type" | "cat" => self.type_cmd(rest, io),
+            "find" => self.find(rest, io),
+            "start" => self.start(rest, io),
+            "edit" | "nano" | "notepad" | "ne" => edit(&*self, rest.first().map(|s| s.as_str())),
+            "cls" | "clear" => { cls(); Ok(()) }
+            "help" | "?" => {
+                wl!(io, "dir [path]              list directory");
+                wl!(io, "cd [path]               change directory (L: switches drive)");
+                wl!(io, "del <file>...           delete files");
+                wl!(io, "md <dir>                create directory");
+                wl!(io, "rd [/s] <dir>           remove directory (/s recursive)");
+                wl!(io, "copy <src> <dst>        copy file (cross-volume ok)");
+                wl!(io, "echo [text]             print text");
+                wl!(io, "type [file...]          print files (or stdin)");
+                wl!(io, "find [/i] [/v] <txt> [file...]   filter lines");
+                wl!(io, "start <prog> [args]     run .com (64-bit flat) / .efi; bare names work too");
+                wl!(io, "edit [file]             nano-like editor (alias: nano, notepad)");
+                wl!(io, "mount                   rescan + list; mount fsN L: ; mount -d L:");
+                wl!(io, "disk-list               list block devices");
+                wl!(io, "diskmgr                 disk manager");
+                wl!(io, "cls | reboot | shutdown | exit");
+                wl!(io, "operators: cmd1 | cmd2   cmd > file   cmd >> file   cmd < file   \"quoted args\"");
+                Ok(())
+            }
+            "reboot" => uefi::runtime::reset(ResetType::COLD, Status::SUCCESS, None),
+            "shutdown" => uefi::runtime::reset(ResetType::SHUTDOWN, Status::SUCCESS, None),
+            "exit" => {
+                self.quit = true;
+                Ok(())
+            }
+            _ => {
+                if self.locate(&a[0]).is_some() {
+                    self.start(a, io)
+                } else {
+                    Err(format!("'{}' is not recognized", a[0]))
+                }
+            }
+        }
+    }
+
+    fn run_line(&mut self, line: &str) {
+        let toks = match tokenize(line) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("error: {e}");
+                return;
+            }
+        };
+        let stages = match parse(toks) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("error: {e}");
+                return;
+            }
+        };
+        let n = stages.len();
+        let mut carry: Option<Vec<u8>> = None;
+        for (i, st) in stages.iter().enumerate() {
+            let direct = i + 1 == n && st.outfile.is_none();
+            let mut io = Io::new(direct);
+            if let Some(c) = carry.take() {
+                io.input = c;
+                io.has_input = true;
+            }
+            if let Some(f) = &st.infile {
+                match self.read_file(f) {
+                    Ok(d) => {
+                        io.input = d;
+                        io.has_input = true;
+                    }
+                    Err(e) => {
+                        println!("error: {f}: {e}");
+                        return;
+                    }
+                }
+            }
+            if let Err(e) = self.exec(&st.args, &mut io) {
+                println!("error: {e}");
+            }
+            if self.quit {
+                return;
+            }
+            if let Some((f, app)) = &st.outfile {
+                if let Err(e) = self.write_file(f, &io.out, *app) {
+                    println!("error: {f}: {e}");
+                }
+            } else if i + 1 < n {
+                carry = Some(core::mem::take(&mut io.out));
+            }
+        }
+    }
+}
+
+#[entry]
+fn main() -> Status {
+    uefi::helpers::init().unwrap();
+    let _ = boot::set_watchdog_timer(0, 0x10000, None);
+    cls();
+    println!("EFICOMMAND v0.2 - type 'help'\n");
+    let mut sh = Shell::new();
+    while !sh.quit {
+        print!("{}", sh.prompt());
+        let l = read_line();
+        sh.run_line(&l);
+    }
+    Status::SUCCESS
+}
