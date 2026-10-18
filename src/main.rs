@@ -1,10 +1,13 @@
-//! EFICOMMAND v0.3 - single-file CLI shell for UEFI.
+//! EFICOMMAND v0.4 - single-file CLI shell for UEFI.
 //!
-//! Commands: dir cd del md rd copy mount disk-list diskmgr echo type find start edit kbl
-//!           help cls reboot shutdown exit
+//! Commands: dir cd del md rd copy xcopy move ren mount disk-list diskmgr echo type find
+//!           start edit kbl help cls reboot shutdown exit
 //! Operators: | < > >> ; && &
 //! Bare names run .com (x86-64 flat binary, ComApi at RCX) or .efi images.
-//! .kbl files remap function/special keys to characters (see the kbl command).
+//! Keyboard: \EFICOMMAND.kbl (or \kbl.kbl) on the boot drive auto-loads at startup.
+//! Use 'kbl test' to see what scancode/char every key actually sends, then map it.
+// Author: @syed930s (on github)
+
 
 #![no_main]
 #![no_std]
@@ -68,6 +71,14 @@ fn le32(b: &[u8]) -> u32 {
     u32::from_le_bytes(b[..4].try_into().unwrap())
 }
 
+fn base(p: &str) -> &str {
+    p.trim_end_matches('\\').rsplit('\\').next().unwrap_or("")
+}
+
+fn joinp(dir: &str, name: &str) -> String {
+    format!("{}\\{}", dir.trim_end_matches('\\'), name)
+}
+
 fn print_bytes(b: &[u8]) {
     let s = String::from_utf8_lossy(b);
     let mut buf = String::new();
@@ -114,6 +125,7 @@ const DEF_KBL: &[(u16, char)] = &[
 struct Kbl {
     name: String,
     entries: Vec<(u16, char)>,
+    cmap: Vec<(char, char)>,
 }
 
 static mut CUR_KBL: Option<Box<Kbl>> = None;
@@ -123,6 +135,24 @@ fn kbl_lookup(sc: u16) -> Option<char> {
         match &*core::ptr::addr_of!(CUR_KBL) {
             Some(k) => k.entries.iter().find(|(s, _)| *s == sc).map(|&(_, c)| c),
             None => DEF_KBL.iter().find(|(s, _)| *s == sc).map(|&(_, c)| c),
+        }
+    }
+}
+
+fn kbl_remap_char(c: char) -> char {
+    unsafe {
+        match &*core::ptr::addr_of!(CUR_KBL) {
+            Some(k) => k.cmap.iter().find(|(f, _)| *f == c).map(|&(_, t)| t).unwrap_or(c),
+            None => c,
+        }
+    }
+}
+
+fn cur_kbl_name() -> String {
+    unsafe {
+        match &*core::ptr::addr_of!(CUR_KBL) {
+            Some(k) => k.name.clone(),
+            None => "default (built-in laptop keys)".to_string(),
         }
     }
 }
@@ -206,6 +236,7 @@ fn read_line() -> String {
                         }
                     }
                     c if (c as u32) >= 0x20 => {
+                        let c = kbl_remap_char(c);
                         s.push(c);
                         print!("{c}");
                     }
@@ -444,6 +475,8 @@ fn parse(toks: Vec<Tok>) -> Result<Vec<(Join, Vec<Stage>)>, String> {
 
 // ---------------------------------------------------------------- block devices
 
+const GPT_BDP: [u8; 16] = [0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7];
+
 fn block_handles() -> Vec<Handle> {
     boot::locate_handle_buffer(SearchType::from_proto::<BlockIO>())
     .map(|b| b.to_vec())
@@ -494,9 +527,8 @@ fn disk_list<W: Write>(w: &mut W) {
 
 fn guid_name(g: &[u8]) -> &'static str {
     const ESP: [u8; 16] = [0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B];
-    const BDP: [u8; 16] = [0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7];
     const LNX: [u8; 16] = [0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4];
-    if g == ESP { "ESP" } else if g == BDP { "MS-Basic" } else if g == LNX { "Linux" } else { "other" }
+    if g == ESP { "ESP" } else if g == GPT_BDP { "MS-Basic" } else if g == LNX { "Linux" } else { "other" }
 }
 
 fn rd_blocks(b: &mut ScopedProtocol<BlockIO>, lba: u64, count: u64) -> Result<Vec<u8>, String> {
@@ -507,12 +539,28 @@ fn rd_blocks(b: &mut ScopedProtocol<BlockIO>, lba: u64, count: u64) -> Result<Ve
     Ok(buf)
 }
 
-fn gpt_dump<W: Write>(w: &mut W, b: &mut ScopedProtocol<BlockIO>) -> Result<(), String> {
-    let bs = b.media().block_size() as u64;
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
+}
+
+fn gpt_hdr(b: &mut ScopedProtocol<BlockIO>) -> Result<Vec<u8>, String> {
     let hdr = rd_blocks(b, 1, 1)?;
     if &hdr[0..8] != b"EFI PART" {
         return Err("no GPT header at LBA 1".to_string());
     }
+    Ok(hdr)
+}
+
+fn gpt_dump<W: Write>(w: &mut W, b: &mut ScopedProtocol<BlockIO>) -> Result<(), String> {
+    let bs = b.media().block_size() as u64;
+    let hdr = gpt_hdr(b)?;
     let elba = le64(&hdr[72..]);
     let n = le32(&hdr[80..]) as u64;
     let esz = le32(&hdr[84..]) as u64;
@@ -548,6 +596,126 @@ fn gpt_dump<W: Write>(w: &mut W, b: &mut ScopedProtocol<BlockIO>) -> Result<(), 
     Ok(())
 }
 
+// apply f to the GPT entry array, then fix up both primary and backup GPTs
+fn gpt_commit(b: &mut ScopedProtocol<BlockIO>, f: impl FnOnce(&mut [u8]) -> Result<(), String>) -> Result<(), String> {
+    let bs = b.media().block_size() as u64;
+    let id = b.media().media_id();
+    let last_lba = b.media().last_block();
+    if b.media().is_read_only() {
+        return Err("media is read-only".to_string());
+    }
+    let mut hdr = gpt_hdr(b)?;
+    let hsize = le32(&hdr[12..]) as usize;
+    if hsize < 92 || hsize as u64 > bs {
+        return Err("bad GPT header size".to_string());
+    }
+    let elba = le64(&hdr[72..]);
+    let n = le32(&hdr[80..]) as usize;
+    let esz = le32(&hdr[84..]) as usize;
+    if esz < 128 || n == 0 || n > 4096 {
+        return Err("bad GPT header".to_string());
+    }
+    let eblocks = ((n * esz) as u64 + bs - 1) / bs;
+    let mut ents = rd_blocks(b, elba, eblocks)?;
+    f(&mut ents[..n * esz])?;
+    let ecrc = crc32(&ents[..n * esz]);
+    hdr[88..92].copy_from_slice(&ecrc.to_le_bytes());
+    hdr[16..20].fill(0);
+    let hcrc = crc32(&hdr[..hsize]);
+    hdr[16..20].copy_from_slice(&hcrc.to_le_bytes());
+    b.write_blocks(id, elba, &ents).map_err(es)?;
+    b.write_blocks(id, 1, &hdr).map_err(es)?;
+    let mut bh = rd_blocks(b, last_lba, 1)?;
+    if &bh[0..8] == b"EFI PART" {
+        let belba = le64(&bh[32..]);
+        bh[88..92].copy_from_slice(&ecrc.to_le_bytes());
+        bh[16..20].fill(0);
+        let bhcrc = crc32(&bh[..hsize]);
+        bh[16..20].copy_from_slice(&bhcrc.to_le_bytes());
+        b.write_blocks(id, belba, &ents).map_err(es)?;
+        b.write_blocks(id, last_lba, &bh).map_err(es)?;
+    }
+    b.flush_blocks().map_err(es)
+}
+
+fn gpt_del(b: &mut ScopedProtocol<BlockIO>, idx: usize) -> Result<(), String> {
+    let hdr = gpt_hdr(b)?;
+    let n = le32(&hdr[80..]) as usize;
+    let esz = le32(&hdr[84..]) as usize;
+    if idx >= n {
+        return Err("no such partition entry".to_string());
+    }
+    gpt_commit(b, |ents| {
+        let e = &mut ents[idx * esz..(idx + 1) * esz];
+        if e[0..16].iter().all(|&x| x == 0) {
+            return Err("partition entry is already empty".to_string());
+        }
+        e[0..16].fill(0);
+        Ok(())
+    })
+}
+
+fn gpt_new(b: &mut ScopedProtocol<BlockIO>, size_blocks: u64, name: &str) -> Result<usize, String> {
+    let bs = b.media().block_size() as u64;
+    let id = b.media().media_id();
+    let last_lba = b.media().last_block();
+    let hdr = gpt_hdr(b)?;
+    let n = le32(&hdr[80..]) as usize;
+    let esz = le32(&hdr[84..]) as usize;
+    if esz < 128 || n == 0 || n > 4096 {
+        return Err("bad GPT header".to_string());
+    }
+    let elba = le64(&hdr[72..]);
+    let eblocks = ((n * esz) as u64 + bs - 1) / bs;
+    let ents = rd_blocks(b, elba, eblocks)?;
+    let mut free = None;
+    let mut maxl = 0u64;
+    for i in 0..n {
+        let e = &ents[i * esz..(i + 1) * esz];
+        if e[0..16].iter().all(|&x| x == 0) {
+            if free.is_none() {
+                free = Some(i);
+            }
+        } else {
+            maxl = maxl.max(le64(&e[40..]));
+        }
+    }
+    let idx = free.ok_or("no free partition entries")?;
+    let align = if bs >= 1_048_576 { 1 } else { 1_048_576 / bs };
+    let first = if maxl == 0 { align } else { ((maxl + 1 + align - 1) / align) * align };
+    let last = first + size_blocks - 1;
+    if last > last_lba.saturating_sub(34) {
+        return Err(format!("not enough space: last block would be {last}, disk ends at {last_lba}"));
+    }
+    let mut g = [0u8; 16];
+    let t = uefi::runtime::get_time()
+    .map(|t| (t.second() as u64) << 40 ^ (t.nanosecond() as u64) << 8 | t.day() as u64)
+    .unwrap_or(0x1234_5678_9ABC_DEF0);
+    let mut x = t ^ (id as u64) << 17 | 0x9E37_79B9_7F4A_7C15;
+    for c in g.chunks_mut(8) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        c.copy_from_slice(&x.to_le_bytes());
+    }
+    g[7] = (g[7] & 0x0F) | 0x40;
+    g[8] = (g[8] & 0x3F) | 0x80;
+    gpt_commit(b, |ents| {
+        let e = &mut ents[idx * esz..(idx + 1) * esz];
+        e[0..16].copy_from_slice(&GPT_BDP);
+        e[16..32].copy_from_slice(&g);
+        e[32..40].copy_from_slice(&first.to_le_bytes());
+        e[40..48].copy_from_slice(&last.to_le_bytes());
+        e[48..56].fill(0);
+        e[56..128].fill(0);
+        for (j, ch) in name.chars().take(36).enumerate() {
+            e[56 + j * 2..56 + j * 2 + 2].copy_from_slice(&(ch as u16).to_le_bytes());
+        }
+        Ok(())
+    })?;
+    Ok(idx)
+}
+
 fn diskmgr() {
     println!("diskmgr - type 'help' for commands, 'exit' to leave");
     loop {
@@ -573,6 +741,10 @@ fn diskmgr() {
                                          println!("gpt <d>                  dump GPT partitions");
                                          println!("read <d> <lba> [n]       hexdump n blocks (default 1, max 8)");
                                          println!("zero <d> <lba> <n>       write n zeroed blocks");
+                                         println!("new <d> <size> [name]    create GPT partition, size like 512M / 4G (default M)");
+                                         println!("del <d> <part#>          delete a GPT partition entry");
+                                         println!("                         (only the table entry is removed; the data blocks");
+                                         println!("                          are NOT erased, but the OS will no longer see it)");
                                          println!("exit");
                                          Ok(())
                                      }
@@ -620,6 +792,31 @@ fn diskmgr() {
                                          }
                                          b.flush_blocks().map_err(es)?;
                                          println!("zeroed {n} blocks @ {lba}");
+                                         Ok(())
+                                     }
+                                     "new" => {
+                                         let mut b = pick(1)?;
+                                         let sz = a.get(2).ok_or("missing size (e.g. 512M or 4G)")?;
+                                         let up = sz.to_ascii_uppercase();
+                                         let (num_s, mult) = if let Some(x) = up.strip_suffix('G') {
+                                             (x, 1u64 << 30)
+                                         } else if let Some(x) = up.strip_suffix('M') {
+                                             (x, 1u64 << 20)
+                                         } else {
+                                             (up.as_str(), 1u64 << 20)
+                                         };
+                                         let v: u64 = num_s.parse().map_err(|_| "bad size".to_string())?;
+                                         let blocks = core::cmp::max(1, v * mult / b.media().block_size() as u64);
+                                         let name = if a.len() > 3 { a[3..].join(" ") } else { "EFICMD".to_string() };
+                                         let idx = gpt_new(&mut b, blocks, &name)?;
+                                         println!("created partition #{idx} '{name}' ({blocks} blocks)");
+                                         Ok(())
+                                     }
+                                     "del" => {
+                                         let mut b = pick(1)?;
+                                         let i = num(2)?;
+                                         gpt_del(&mut b, i as usize)?;
+                                         println!("deleted partition #{i} (entry removed, data not erased)");
                                          Ok(())
                                      }
                                      _ => Err("unknown command".to_string()),
@@ -1059,6 +1256,7 @@ impl<'a> Editor<'a> {
                             }
                         }
                         0x20..=0x7E | 0xA0..=0xFFFF => {
+                            let ch = kbl_remap_char(ch);
                             self.lines[self.cy].insert(self.cx, ch);
                             self.cx += 1;
                             self.modified = true;
@@ -1353,7 +1551,7 @@ impl Shell {
     fn load_kbl(&self, f: &str) -> Result<(), String> {
         let data = self.read_file(f)?;
         let text = String::from_utf8_lossy(&data);
-        let mut k = Kbl { name: "custom".to_string(), entries: Vec::new() };
+        let mut k = Kbl { name: "custom".to_string(), entries: Vec::new(), cmap: Vec::new() };
         for (n, line) in text.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
@@ -1366,12 +1564,24 @@ impl Shell {
                 k.name = r.trim().to_string();
                 continue;
             }
+            let kt = l.trim();
+            if kt.len() >= 3 && kt.starts_with('\'') && kt.ends_with('\'') {
+                let mut cit = kt[1..kt.len() - 1].chars();
+                let from = cit.next().ok_or_else(|| format!("{}:{}: empty char key", f, n + 1))?;
+                if cit.next().is_some() {
+                    return Err(format!("{}:{}: char key must be one character", f, n + 1));
+                }
+                let to = kbl_char(r.trim()).map_err(|e| format!("{}:{}: {e}", f, n + 1))?;
+                k.cmap.retain(|(c, _)| *c != from);
+                k.cmap.push((from, to));
+                continue;
+            }
             let sc = parse_key(l).map_err(|e| format!("{}:{}: {e}", f, n + 1))?;
             let ch = kbl_char(r.trim()).map_err(|e| format!("{}:{}: {e}", f, n + 1))?;
             k.entries.retain(|(s, _)| *s != sc);
             k.entries.push((sc, ch));
         }
-        if k.entries.is_empty() {
+        if k.entries.is_empty() && k.cmap.is_empty() {
             return Err("no key mappings found in file".to_string());
         }
         unsafe {
@@ -1380,18 +1590,42 @@ impl Shell {
         Ok(())
     }
 
+    fn kbl_test(&self) {
+        println!("kbl test - press keys to see what the firmware sends (Esc to exit)");
+        loop {
+            match getkey() {
+                Key::Printable(c) => {
+                    println!("  printable U+{:04X}  '{}'", u16::from(c) as u32, char::from(c))
+                }
+                Key::Special(s) => {
+                    if s.0 == 0x17 {
+                        println!("  ESC - exiting test");
+                        return;
+                    }
+                    let mapped = kbl_lookup(s.0)
+                    .map(|c| format!("  -> mapped to '{c}'"))
+                    .unwrap_or_default();
+                    println!("  scancode 0x{:02X} ({}){}", s.0, key_name(s.0), mapped);
+                }
+            }
+        }
+    }
+
     fn kbl(&self, rest: &[String], io: &mut Io) -> Result<(), String> {
         match rest.first().map(|s| s.as_str()) {
             None => {
-                let (name, entries) = unsafe {
+                wl!(io, "keyboard layout: {}", cur_kbl_name());
+                let (entries, cmap) = unsafe {
                     match &*core::ptr::addr_of!(CUR_KBL) {
-                        Some(k) => (k.name.clone(), k.entries.clone()),
-                        None => ("default (built-in laptop keys)".to_string(), DEF_KBL.to_vec()),
+                        Some(k) => (k.entries.clone(), k.cmap.clone()),
+                        None => (DEF_KBL.to_vec(), Vec::new()),
                     }
                 };
-                wl!(io, "keyboard layout: {name}");
                 for (sc, ch) in entries {
                     wl!(io, "  {:<6} = {ch}", key_name(sc));
+                }
+                for (f, t) in cmap {
+                    wl!(io, "  '{f}'    -> '{t}'");
                 }
                 Ok(())
             }
@@ -1402,15 +1636,13 @@ impl Shell {
                 wl!(io, "layout reset to default");
                 Ok(())
             }
+            Some("test") => {
+                self.kbl_test();
+                Ok(())
+            }
             Some(f) => {
                 self.load_kbl(f)?;
-                let name = unsafe {
-                    match &*core::ptr::addr_of!(CUR_KBL) {
-                        Some(k) => k.name.clone(),
-                        None => String::new(),
-                    }
-                };
-                wl!(io, "layout loaded: {name}");
+                wl!(io, "layout loaded: {}", cur_kbl_name());
                 Ok(())
             }
         }
@@ -1514,19 +1746,111 @@ impl Shell {
             return Err("usage: copy <src> <dst>".to_string());
         }
         let (sd, sp) = self.resolve(&rest[0]);
-        let (dd, mut dp) = self.resolve(&rest[1]);
+        let (dd, dp) = self.resolve(&rest[1]);
         let data = self.with_fs(sd, |fs| fs.read(pb(&sp)?).map_err(es))?;
-        let name = sp.rsplit('\\').next().unwrap_or("").to_string();
         let dst_is_dir = self.with_fs(dd, |fs| Ok(Self::is_dir(fs, &dp)))?;
-        if dst_is_dir {
-            if !dp.ends_with('\\') {
-                dp.push('\\');
-            }
-            dp.push_str(&name);
-        }
+        let ddp = if dst_is_dir { joinp(&dp, base(&sp)) } else { dp };
         let n = data.len();
-        self.with_fs(dd, |fs| fs.write(pb(&dp)?, data).map_err(es))?;
-        wl!(io, "copied {n} bytes -> {}:{}", letter(dd), dp);
+        self.with_fs(dd, |fs| fs.write(pb(&ddp)?, data).map_err(es))?;
+        wl!(io, "copied {n} bytes -> {}:{}", letter(dd), ddp);
+        Ok(())
+    }
+
+    fn xcopy_tree(&self, sd: usize, sp: &str, dd: usize, dp: &str, empty: bool, nf: &mut u64, nb: &mut u64) -> Result<(), String> {
+        let is_dir = self.with_fs(sd, |fs| Ok(Self::is_dir(fs, sp)))?;
+        if !is_dir {
+            let data = self.with_fs(sd, |fs| fs.read(pb(sp)?).map_err(es))?;
+            *nb += data.len() as u64;
+            self.with_fs(dd, |fs| fs.write(pb(dp)?, data).map_err(es))?;
+            *nf += 1;
+            return Ok(());
+        }
+        let ents = self.with_fs(sd, |fs| {
+            let it = fs.read_dir(pb(sp)?).map_err(es)?;
+            let mut v = Vec::new();
+            for e in it {
+                v.push(e.map_err(es)?);
+            }
+            Ok(v)
+        })?;
+        let mut names = Vec::new();
+        for e in &ents {
+            let name = format!("{}", e.file_name());
+            if name == "." || name == ".." {
+                continue;
+            }
+            names.push(name);
+        }
+        if !names.is_empty() || empty {
+            let _ = self.with_fs(dd, |fs| fs.create_dir_all(pb(dp)?).map_err(es));
+        }
+        for name in names {
+            self.xcopy_tree(sd, &joinp(sp, &name), dd, &joinp(dp, &name), empty, nf, nb)?;
+        }
+        Ok(())
+    }
+
+    fn xcopy(&self, rest: &[String], io: &mut Io) -> Result<(), String> {
+        let mut empty = false;
+        let mut args: Vec<&String> = Vec::new();
+        for a in rest {
+            if a.eq_ignore_ascii_case("/e") {
+                empty = true;
+            } else {
+                args.push(a);
+            }
+        }
+        if args.len() != 2 {
+            return Err("usage: xcopy <src> <dst> [/e]   (recursive; /e copies empty dirs too)".to_string());
+        }
+        let (sd, sp) = self.resolve(args[0]);
+        let (dd, dp) = self.resolve(args[1]);
+        let dst_is_dir = self.with_fs(dd, |fs| Ok(Self::is_dir(fs, &dp)))?;
+        let ddp = if dst_is_dir { joinp(&dp, base(&sp)) } else { dp };
+        let (mut nf, mut nb) = (0u64, 0u64);
+        self.xcopy_tree(sd, &sp, dd, &ddp, empty, &mut nf, &mut nb)?;
+        wl!(io, "copied {nf} file(s), {} -> {}:{}", human(nb), letter(dd), ddp);
+        Ok(())
+    }
+
+    fn ren(&self, rest: &[String], io: &mut Io) -> Result<(), String> {
+        if rest.len() != 2 {
+            return Err("usage: ren <old> <new>".to_string());
+        }
+        let (d, p) = self.resolve(&rest[0]);
+        let (d2, p2) = self.resolve(&rest[1]);
+        if d != d2 {
+            return Err("ren works within one drive (use 'move' across drives)".to_string());
+        }
+        self.with_fs(d, |fs| fs.rename(pb(&p)?, pb(&p2)?).map_err(es))?;
+        wl!(io, "renamed -> {}:{}", letter(d2), p2);
+        Ok(())
+    }
+
+    fn move_cmd(&self, rest: &[String], io: &mut Io) -> Result<(), String> {
+        if rest.len() != 2 {
+            return Err("usage: move <src> <dst>".to_string());
+        }
+        let (sd, sp) = self.resolve(&rest[0]);
+        let (dd, dp) = self.resolve(&rest[1]);
+        let src_is_dir = self.with_fs(sd, |fs| Ok(Self::is_dir(fs, &sp)))?;
+        let dst_is_dir = self.with_fs(dd, |fs| Ok(Self::is_dir(fs, &dp)))?;
+        let ddp = if dst_is_dir { joinp(&dp, base(&sp)) } else { dp };
+        if sd == dd {
+            let r = self.with_fs(sd, |fs| fs.rename(pb(&sp)?, pb(&ddp)?).map_err(es));
+            if r.is_ok() {
+                wl!(io, "moved -> {}:{}", letter(dd), ddp);
+                return Ok(());
+            }
+        }
+        let (mut nf, mut nb) = (0u64, 0u64);
+        self.xcopy_tree(sd, &sp, dd, &ddp, true, &mut nf, &mut nb)?;
+        if src_is_dir {
+            self.with_fs(sd, |fs| fs.remove_dir_all(pb(&sp)?).map_err(es))?;
+        } else {
+            self.with_fs(sd, |fs| fs.remove_file(pb(&sp)?).map_err(es))?;
+        }
+        wl!(io, "moved {nf} file(s), {} -> {}:{}", human(nb), letter(dd), ddp);
         Ok(())
     }
 
@@ -1699,6 +2023,9 @@ impl Shell {
             "md" | "mkdir" => self.md(arg0),
             "rd" | "rmdir" => self.rd(rest),
             "copy" | "cp" => self.copy(rest, io),
+            "xcopy" => self.xcopy(rest, io),
+            "ren" | "rename" => self.ren(rest, io),
+            "move" | "mv" => self.move_cmd(rest, io),
             "mount" => self.mount(rest, io),
             "disk-list" => {
                 disk_list(io);
@@ -1727,16 +2054,21 @@ impl Shell {
                 wl!(io, "del <file>...           delete files");
                 wl!(io, "md <dir>                create directory");
                 wl!(io, "rd [/s] <dir>           remove directory (/s recursive)");
-                wl!(io, "copy <src> <dst>        copy file (cross-volume ok)");
+                wl!(io, "copy <src> <dst>        copy a file (cross-volume ok)");
+                wl!(io, "xcopy <src> <dst> [/e]  copy directories recursively (/e keeps empty dirs)");
+                wl!(io, "ren <old> <new>         rename (same drive)");
+                wl!(io, "move <src> <dst>        move file/dir (rename, or copy+delete cross-volume)");
                 wl!(io, "echo [text]             print text");
                 wl!(io, "type [file...]          print files (or stdin)");
                 wl!(io, "find [/i] [/v] <txt> [file...]   filter lines");
                 wl!(io, "start <prog> [args]     run .com (64-bit flat) / .efi; bare names work too");
                 wl!(io, "edit [file]             nano-like editor (alias: nano, notepad)");
-                wl!(io, "kbl [file]              load keyboard layout (.kbl); 'kbl default' resets");
+                wl!(io, "kbl [file]              load keyboard layout; 'kbl default' resets;");
+                wl!(io, "                        'kbl test' shows what each key sends");
+                wl!(io, "                        (\\EFICOMMAND.kbl auto-loads from boot drive)");
                 wl!(io, "mount                   rescan + list; mount fsN L: ; mount -d L:");
                 wl!(io, "disk-list               list block devices");
-                wl!(io, "diskmgr                 disk manager");
+                wl!(io, "diskmgr                 disk manager (gpt/new/del partitions)");
                 wl!(io, "cls | reboot | shutdown | exit");
                 wl!(io, "operators: a ; b (always)   a && b (b if a ok)   a & b (b, quiet)");
                 wl!(io, "           a | b   a > f   a >> f   a < f   \"quoted args\"");
@@ -1840,8 +2172,15 @@ fn main() -> Status {
     uefi::helpers::init().unwrap();
     let _ = boot::set_watchdog_timer(0, 0x10000, None);
     cls();
-    println!("EFICOMMAND v0.3 - type 'help'\n");
+    println!("EFICOMMAND v0.4 - type 'help'\n");
     let mut sh = Shell::new();
+    for cand in ["EFICOMMAND.kbl", "kbl.kbl"] {
+        let p = format!("{}:\\{}", letter(sh.boot), cand);
+        if sh.load_kbl(&p).is_ok() {
+            println!("keyboard layout: {}", cur_kbl_name());
+            break;
+        }
+    }
     while !sh.quit {
         print!("{}", sh.prompt());
         let l = read_line();
