@@ -1,0 +1,29 @@
+// French (AZERTY). Digits are on Shift. BKSL mapped to * µ (wildcard needs it);
+// \ | unreachable - use / as path separator.
+name = "French (AZERTY)"
+key <TLDE> { [ twosuperior ] };
+key <AE01> { [ ampersand, 1 ] };
+key <AE02> { [ U+E9, 2 ] };
+key <AE03> { [ quotedbl, 3 ] };
+key <AE04> { [ apostrophe, 4 ] };
+key <AE05> { [ parenleft, 5 ] };
+key <AE06> { [ minus, 6 ] };
+key <AE07> { [ U+E8, 7 ] };
+key <AE08> { [ underscore, 8 ] };
+key <AE09> { [ U+E7, 9 ] };
+key <AE10> { [ U+E0, 0 ] };
+key <AE11> { [ parenright, degree ] };
+key <AE12> { [ equal, plus ] };
+key <AD01> { [ a, A ] };
+key <AD02> { [ z, Z ] };
+key <AD11> { [ asciicircum, U+A8 ] };
+key <AD12> { [ dollar, sterling ] };
+key <AC01> { [ q, Q ] };
+key <AC10> { [ m, M ] };
+key <AC11> { [ U+F9, percent ] };
+key <AB01> { [ w, W ] };
+key <AB07> { [ comma, question ] };
+key <AB08> { [ semicolon, period ] };
+key <AB09> { [ colon, slash ] };
+key <AB10> { [ exclam, section ] };
+key <BKSL> { [ asterisk, mu ] };

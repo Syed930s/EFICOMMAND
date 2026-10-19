@@ -1,0 +1,8 @@
+// English (UK) - ISO. BKSL (\ |) left as US passthrough; # ~ unreachable
+// (firmware can't tell BKSL from the ISO <> key). Uncomment to get # ~ instead.
+name = "English (UK)"
+key <TLDE> { [ grave, notsign ] };
+key <AE02> { [ 2, quotedbl ] };
+key <AE03> { [ 3, sterling ] };
+key <AC11> { [ apostrophe, at ] };
+// key <BKSL> { [ numbersign, asciitilde ] };

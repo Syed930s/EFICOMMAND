@@ -1,0 +1,22 @@
+// German (QWERTZ). AltGr layer (@ { } [ ] etc) is not reachable via UEFI.
+// BKSL left as \ | passthrough.
+name = "German (DE)"
+key <TLDE> { [ asciicircum, degree ] };
+key <AE02> { [ 2, quotedbl ] };
+key <AE03> { [ 3, section ] };
+key <AE06> { [ 6, ampersand ] };
+key <AE07> { [ 7, slash ] };
+key <AE08> { [ 8, parenleft ] };
+key <AE09> { [ 9, parenright ] };
+key <AE10> { [ 0, equal ] };
+key <AE11> { [ ssharp, question ] };
+key <AE12> { [ U+B4, grave ] };
+key <AD06> { [ z, Z ] };
+key <AD11> { [ udiaeresis, Udiaeresis ] };
+key <AD12> { [ plus, asterisk ] };
+key <AC10> { [ odiaeresis, Odiaeresis ] };
+key <AC11> { [ adiaeresis, Adiaeresis ] };
+key <AB01> { [ y, Y ] };
+key <AB08> { [ comma, semicolon ] };
+key <AB09> { [ period, colon ] };
+key <AB10> { [ minus, underscore ] };

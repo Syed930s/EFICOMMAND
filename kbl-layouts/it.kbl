@@ -1,0 +1,20 @@
+// Italian (IT, ISO). \ | on TLDE, BKSL is ù §.
+name = "Italian (IT)"
+key <TLDE> { [ backslash, bar ] };
+key <AE02> { [ 2, quotedbl ] };
+key <AE03> { [ 3, sterling ] };
+key <AE06> { [ 6, ampersand ] };
+key <AE07> { [ 7, slash ] };
+key <AE08> { [ 8, parenleft ] };
+key <AE09> { [ 9, parenright ] };
+key <AE10> { [ 0, equal ] };
+key <AE11> { [ apostrophe, question ] };
+key <AE12> { [ U+EC, asciicircum ] };
+key <AD11> { [ U+E8, U+E9 ] };
+key <AD12> { [ plus, asterisk ] };
+key <AC10> { [ U+F2, U+E7 ] };
+key <AC11> { [ U+E0, degree ] };
+key <AB08> { [ comma, semicolon ] };
+key <AB09> { [ period, colon ] };
+key <AB10> { [ minus, underscore ] };
+key <BKSL> { [ U+F9, section ] };

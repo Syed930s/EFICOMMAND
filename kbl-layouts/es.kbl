@@ -1,0 +1,19 @@
+// Spanish (ES, ISO). BKSL (ç) left as \ | passthrough.
+name = "Spanish (ES)"
+key <TLDE> { [ U+BA, U+AA ] };
+key <AE02> { [ 2, quotedbl ] };
+key <AE03> { [ 3, U+B7 ] };
+key <AE06> { [ 6, ampersand ] };
+key <AE07> { [ 7, slash ] };
+key <AE08> { [ 8, parenleft ] };
+key <AE09> { [ 9, parenright ] };
+key <AE10> { [ 0, equal ] };
+key <AE11> { [ apostrophe, question ] };
+key <AE12> { [ U+A1, U+BF ] };
+key <AD11> { [ grave, asciicircum ] };
+key <AD12> { [ plus, asterisk ] };
+key <AC10> { [ U+F1, U+D1 ] };
+key <AC11> { [ U+B4, U+A8 ] };
+key <AB08> { [ comma, semicolon ] };
+key <AB09> { [ period, colon ] };
+key <AB10> { [ minus, underscore ] };
