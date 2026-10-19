@@ -1,13 +1,14 @@
-//! EFICOMMAND v0.4 - single-file CLI shell for UEFI.
+//! EFICOMMAND v0.5 - single-file CLI shell for UEFI.
 //!
 //! Commands: dir cd del md rd copy xcopy move ren mount disk-list diskmgr echo type find
 //!           start edit kbl help cls reboot shutdown exit
-//! Operators: | < > >> ; && &
-//! Bare names run .com (x86-64 flat binary, ComApi at RCX) or .efi images.
-//! Keyboard: \EFICOMMAND.kbl (or \kbl.kbl) on the boot drive auto-loads at startup.
-//! Use 'kbl test' to see what scancode/char every key actually sends, then map it.
-// Author: @syed930s (on github)
-
+//! Operators: | < > >> ; && &      Wildcards: * ?
+//! Scripts: name.bat runs a batch file (one command per line, :: or REM = comment).
+//! Binaries: .com (x86-64 flat, ComApi at RCX) / .efi, bare names work too.
+//! Keyboard: xkb-style .kbl files (key <AE02> { [ 2, quotedbl ] };). \EFICOMMAND.kbl
+//!           on the boot drive auto-loads. 'kbl test' shows what each key really sends.
+//! Note: UEFI never reports scancodes for printable keys - the firmware translates
+//! with its own (usually US) layout. KBL inverts that US table, so layouts work.
 
 #![no_main]
 #![no_std]
@@ -111,50 +112,115 @@ fn getkey() -> Key {
 
 // ---------------------------------------------------------------- keyboard layouts (.kbl)
 
-// scancode values per the UEFI spec: F1=0x0B .. F12=0x16, ESCAPE=0x17
-const DEF_KBL: &[(u16, char)] = &[
-    (0x0F, '\\'),
-    (0x10, '|'),
-    (0x11, '{'),
-    (0x12, '}'),
-    (0x13, '~'),
-    (0x15, ']'),
-    (0x16, '`'),
+// key position ids (xkb-style names)
+const KEY_NAMES: &[(&str, u16)] = &[
+    ("TLDE", 0),
+    ("AE01", 1), ("AE02", 2), ("AE03", 3), ("AE04", 4), ("AE05", 5), ("AE06", 6),
+    ("AE07", 7), ("AE08", 8), ("AE09", 9), ("AE10", 10), ("AE11", 11), ("AE12", 12),
+    ("AD01", 13), ("AD02", 14), ("AD03", 15), ("AD04", 16), ("AD05", 17), ("AD06", 18),
+    ("AD07", 19), ("AD08", 20), ("AD09", 21), ("AD10", 22), ("AD11", 23), ("AD12", 24),
+    ("AC01", 25), ("AC02", 26), ("AC03", 27), ("AC04", 28), ("AC05", 29), ("AC06", 30),
+    ("AC07", 31), ("AC08", 32), ("AC09", 33), ("AC10", 34), ("AC11", 35), ("AC12", 36),
+    ("AB01", 37), ("AB02", 38), ("AB03", 39), ("AB04", 40), ("AB05", 41), ("AB06", 42),
+    ("AB07", 43), ("AB08", 44), ("AB09", 45), ("AB10", 46),
+    ("LSGT", 47), ("BKSL", 48),
+];
+
+// US layout: every char the firmware can deliver, mapped to (key id, level)
+// level 0 = unshifted, 1 = shifted. This is how we recover the physical key.
+const US_MAP: &[(char, u16, u8)] = &[
+    ('`', 0, 0), ('~', 0, 1),
+    ('1', 1, 0), ('!', 1, 1),
+    ('2', 2, 0), ('@', 2, 1),
+    ('3', 3, 0), ('#', 3, 1),
+    ('4', 4, 0), ('$', 4, 1),
+    ('5', 5, 0), ('%', 5, 1),
+    ('6', 6, 0), ('^', 6, 1),
+    ('7', 7, 0), ('&', 7, 1),
+    ('8', 8, 0), ('*', 8, 1),
+    ('9', 9, 0), ('(', 9, 1),
+    ('0', 10, 0), (')', 10, 1),
+    ('-', 11, 0), ('_', 11, 1),
+    ('=', 12, 0), ('+', 12, 1),
+    ('q', 13, 0), ('Q', 13, 1), ('w', 14, 0), ('W', 14, 1),
+    ('e', 15, 0), ('E', 15, 1), ('r', 16, 0), ('R', 16, 1),
+    ('t', 17, 0), ('T', 17, 1), ('y', 18, 0), ('Y', 18, 1),
+    ('u', 19, 0), ('U', 19, 1), ('i', 20, 0), ('I', 20, 1),
+    ('o', 21, 0), ('O', 21, 1), ('p', 22, 0), ('P', 22, 1),
+    ('[', 23, 0), ('{', 23, 1), (']', 24, 0), ('}', 24, 1),
+    ('a', 25, 0), ('A', 25, 1), ('s', 26, 0), ('S', 26, 1),
+    ('d', 27, 0), ('D', 27, 1), ('f', 28, 0), ('F', 28, 1),
+    ('g', 29, 0), ('G', 29, 1), ('h', 30, 0), ('H', 30, 1),
+    ('j', 31, 0), ('J', 31, 1), ('k', 32, 0), ('K', 32, 1),
+    ('l', 33, 0), ('L', 33, 1),
+    (';', 34, 0), (':', 34, 1), ('\'', 35, 0), ('"', 35, 1),
+    ('z', 37, 0), ('Z', 37, 1), ('x', 38, 0), ('X', 38, 1),
+    ('c', 39, 0), ('C', 39, 1), ('v', 40, 0), ('V', 40, 1),
+    ('b', 41, 0), ('B', 41, 1), ('n', 42, 0), ('N', 42, 1),
+    ('m', 43, 0), ('M', 43, 1),
+    (',', 44, 0), ('<', 44, 1), ('.', 45, 0), ('>', 45, 1),
+    ('/', 46, 0), ('?', 46, 1),
+    ('\\', 48, 0), ('|', 48, 1),
+];
+
+const KEYSYMS: &[(&str, char)] = &[
+    ("grave", '`'), ("asciitilde", '~'), ("notsign", '\u{AC}'),
+    ("quotedbl", '"'), ("sterling", '\u{A3}'), ("EuroSign", '\u{20AC}'),
+    ("dollar", '$'), ("numbersign", '#'), ("asciicircum", '^'),
+    ("ampersand", '&'), ("asterisk", '*'), ("parenleft", '('), ("parenright", ')'),
+    ("minus", '-'), ("underscore", '_'), ("equal", '='), ("plus", '+'),
+    ("bracketleft", '['), ("bracketright", ']'), ("braceleft", '{'), ("braceright", '}'),
+    ("backslash", '\\'), ("bar", '|'), ("brokenbar", '\u{A6}'),
+    ("apostrophe", '\''), ("at", '@'), ("semicolon", ';'), ("colon", ':'),
+    ("comma", ','), ("less", '<'), ("period", '.'), ("greater", '>'),
+    ("slash", '/'), ("question", '?'), ("exclam", '!'), ("space", ' '),
+    ("percent", '%'), ("dead_circumflex", '^'), ("dead_grave", '`'),
+    ("dead_tilde", '~'), ("dead_acute", '\u{B4}'), ("dead_caron", '\u{2C7}'),
+    ("dead_breve", '\u{2D8}'), ("dead_diaeresis", '\u{A8}'), ("dead_abovering", '\u{B0}'),
+    ("twosuperior", '\u{B2}'), ("threesuperior", '\u{B3}'),
+    ("oneeighth", '\u{215B}'), ("onequarter", '\u{BC}'),
+    ("ssharp", '\u{DF}'), ("section", '\u{A7}'), ("degree", '\u{B0}'), ("mu", '\u{B5}'),
+    ("udiaeresis", '\u{FC}'), ("Udiaeresis", '\u{DC}'),
+    ("adiaeresis", '\u{E4}'), ("Adiaeresis", '\u{C4}'),
+    ("odiaeresis", '\u{F6}'), ("Odiaeresis", '\u{D6}'),
 ];
 
 struct Kbl {
     name: String,
-    entries: Vec<(u16, char)>,
+    keys: Vec<(u16, [Option<char>; 4])>,
     cmap: Vec<(char, char)>,
+    scan: Vec<(u16, char)>,
 }
 
 static mut CUR_KBL: Option<Box<Kbl>> = None;
 
-fn kbl_lookup(sc: u16) -> Option<char> {
-    unsafe {
-        match &*core::ptr::addr_of!(CUR_KBL) {
-            Some(k) => k.entries.iter().find(|(s, _)| *s == sc).map(|&(_, c)| c),
-            None => DEF_KBL.iter().find(|(s, _)| *s == sc).map(|&(_, c)| c),
-        }
-    }
+fn cur_kbl() -> Option<&'static Kbl> {
+    unsafe { (&*core::ptr::addr_of!(CUR_KBL)).as_deref() }
 }
 
-fn kbl_remap_char(c: char) -> char {
-    unsafe {
-        match &*core::ptr::addr_of!(CUR_KBL) {
-            Some(k) => k.cmap.iter().find(|(f, _)| *f == c).map(|&(_, t)| t).unwrap_or(c),
-            None => c,
+// what a delivered char becomes under the current layout
+fn kbl_translate(c: char) -> char {
+    if let Some(k) = cur_kbl() {
+        if let Some(&(_, t)) = k.cmap.iter().find(|(f, _)| *f == c) {
+            return t;
+        }
+        if let Some(&(_, kid, lvl)) = US_MAP.iter().find(|(ch, _, _)| *ch == c) {
+            if let Some(&(_, levels)) = k.keys.iter().find(|(id, _)| *id == kid) {
+                if let Some(t) = levels[lvl as usize] {
+                    return t;
+                }
+            }
         }
     }
+    c
+}
+
+fn kbl_lookup(sc: u16) -> Option<char> {
+    cur_kbl().and_then(|k| k.scan.iter().find(|(s, _)| *s == sc).map(|&(_, c)| c))
 }
 
 fn cur_kbl_name() -> String {
-    unsafe {
-        match &*core::ptr::addr_of!(CUR_KBL) {
-            Some(k) => k.name.clone(),
-            None => "default (built-in laptop keys)".to_string(),
-        }
-    }
+    cur_kbl().map(|k| k.name.clone()).unwrap_or_else(|| "English (US) passthrough".to_string())
 }
 
 fn key_name(sc: u16) -> String {
@@ -213,10 +279,26 @@ fn kbl_char(s: &str) -> Result<char, String> {
             Some('r') => Ok('\r'),
             Some('0') => Ok('\0'),
             Some('\\') => Ok('\\'),
+            Some('\'') => Ok('\''),
+            Some('"') => Ok('"'),
             _ => Err("bad escape (use \\\\ for backslash)".into()),
         },
         x => Ok(x),
     }
+}
+
+fn keysym(tok: &str) -> Option<char> {
+    let t = tok.trim();
+    if t.len() >= 3 && t.starts_with('\'') && t.ends_with('\'') {
+        return kbl_char(&t[1..t.len() - 1]).ok();
+    }
+    if let Some(hex) = t.strip_prefix("U+").or_else(|| t.strip_prefix("u+")) {
+        return u32::from_str_radix(hex, 16).ok().and_then(char::from_u32);
+    }
+    if t.chars().count() == 1 {
+        return t.chars().next();
+    }
+    KEYSYMS.iter().find(|(n, _)| n.eq_ignore_ascii_case(t)).map(|&(_, c)| c)
 }
 
 fn read_line() -> String {
@@ -236,7 +318,7 @@ fn read_line() -> String {
                         }
                     }
                     c if (c as u32) >= 0x20 => {
-                        let c = kbl_remap_char(c);
+                        let c = kbl_translate(c);
                         s.push(c);
                         print!("{c}");
                     }
@@ -857,7 +939,10 @@ extern "efiapi" fn com_write(p: *const u8, n: u64) {
 
 extern "efiapi" fn com_getchar() -> u32 {
     match getkey() {
-        Key::Printable(c) => u32::from(u16::from(c)),
+        Key::Printable(c) => {
+            let ch = kbl_translate(char::from(c));
+            u32::from(u16::try_from(ch as u32).unwrap_or(0xFFFF))
+        }
         Key::Special(s) => 0x1_0000 + s.0 as u32,
     }
 }
@@ -1256,7 +1341,7 @@ impl<'a> Editor<'a> {
                             }
                         }
                         0x20..=0x7E | 0xA0..=0xFFFF => {
-                            let ch = kbl_remap_char(ch);
+                            let ch = kbl_translate(ch);
                             self.lines[self.cy].insert(self.cx, ch);
                             self.cx += 1;
                             self.modified = true;
@@ -1423,6 +1508,38 @@ fn edit(sh: &Shell, arg: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------- wildcards
+
+fn has_glob(s: &str) -> bool {
+    s.contains('*') || s.contains('?')
+}
+
+fn glob_match(pat: &str, s: &str) -> bool {
+    let p: Vec<char> = pat.chars().collect();
+    let t: Vec<char> = s.chars().collect();
+    let (mut pi, mut ti, mut star_p, mut star_t) = (0usize, 0usize, usize::MAX, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_p = pi;
+            star_t = ti;
+            pi += 1;
+        } else if star_p != usize::MAX {
+            pi = star_p + 1;
+            star_t += 1;
+            ti = star_t;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 // ---------------------------------------------------------------- shell
 
 struct Shell {
@@ -1432,6 +1549,7 @@ struct Shell {
     cur: usize,
     boot: usize,
     quit: bool,
+    bat_depth: u32,
 }
 
 impl Shell {
@@ -1443,6 +1561,7 @@ impl Shell {
             cur: 2,
             boot: 2,
             quit: false,
+            bat_depth: 0,
         };
         s.scan();
         s
@@ -1551,37 +1670,75 @@ impl Shell {
     fn load_kbl(&self, f: &str) -> Result<(), String> {
         let data = self.read_file(f)?;
         let text = String::from_utf8_lossy(&data);
-        let mut k = Kbl { name: "custom".to_string(), entries: Vec::new(), cmap: Vec::new() };
-        for (n, line) in text.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+        let mut k = Kbl { name: "custom".to_string(), keys: Vec::new(), cmap: Vec::new(), scan: Vec::new() };
+        for (n, line0) in text.lines().enumerate() {
+            let line = line0.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+                continue;
+            }
+            let err = |e: String| format!("{}:{}: {e}", f, n + 1);
+            if line.starts_with("key") || (line.starts_with("Key") && line.contains('<')) {
+                let lt = line.find('<').ok_or_else(|| err("expected <KEY>".into()))?;
+                let gt = line.find('>').ok_or_else(|| err("expected <KEY>".into()))?;
+                let kn = line[lt + 1..gt].trim().to_ascii_uppercase();
+                let id = KEY_NAMES
+                    .iter()
+                    .find(|(nm, _)| *nm == kn)
+                    .map(|&(_, id)| id)
+                    .ok_or_else(|| err(format!("unknown key <{kn}>")))?;
+                let lb = line.find('[').ok_or_else(|| err("expected [ ... ]".into()))?;
+                let rb = line.rfind(']').ok_or_else(|| err("expected [ ... ]".into()))?;
+                let mut levels: [Option<char>; 4] = [None; 4];
+                for (i, tok) in line[lb + 1..rb].split(',').enumerate() {
+                    if i >= 4 {
+                        break;
+                    }
+                    let tok = tok.trim();
+                    if tok.is_empty() {
+                        continue;
+                    }
+                    levels[i] = Some(keysym(tok).ok_or_else(|| err(format!("unknown keysym '{tok}'")))?);
+                }
+                k.keys.retain(|(kid, _)| *kid != id);
+                k.keys.push((id, levels));
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("remap").or_else(|| line.strip_prefix("REMAP")) {
+                let rest = rest.trim_start();
+                let eq = rest.find('=').ok_or_else(|| err("expected remap 'x' = 'y'".into()))?;
+                let from = keysym(rest[..eq].trim()).ok_or_else(|| err("bad remap source".into()))?;
+                let to = keysym(rest[eq + 1..].trim().trim_end_matches(';')).ok_or_else(|| err("bad remap target".into()))?;
+                k.cmap.retain(|(c, _)| *c != from);
+                k.cmap.push((from, to));
                 continue;
             }
             let (l, r) = line
-            .split_once('=')
-            .ok_or_else(|| format!("{}:{}: expected KEY=char", f, n + 1))?;
-            if l.trim().eq_ignore_ascii_case("name") {
+                .split_once('=')
+                .ok_or_else(|| err("expected KEY=char, remap 'x' = 'y' or key <NAME> { [ ... ] }".into()))?;
+            if l.trim().to_ascii_uppercase().starts_with("NAME") {
+                let r = r.trim().trim_end_matches(';');
+                let r = r.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(r);
                 k.name = r.trim().to_string();
                 continue;
             }
             let kt = l.trim();
             if kt.len() >= 3 && kt.starts_with('\'') && kt.ends_with('\'') {
                 let mut cit = kt[1..kt.len() - 1].chars();
-                let from = cit.next().ok_or_else(|| format!("{}:{}: empty char key", f, n + 1))?;
+                let from = cit.next().ok_or_else(|| err("empty char key".into()))?;
                 if cit.next().is_some() {
-                    return Err(format!("{}:{}: char key must be one character", f, n + 1));
+                    return Err(err("char key must be one character".into()));
                 }
-                let to = kbl_char(r.trim()).map_err(|e| format!("{}:{}: {e}", f, n + 1))?;
+                let to = kbl_char(r.trim().trim_end_matches(';')).map_err(err)?;
                 k.cmap.retain(|(c, _)| *c != from);
                 k.cmap.push((from, to));
                 continue;
             }
-            let sc = parse_key(l).map_err(|e| format!("{}:{}: {e}", f, n + 1))?;
-            let ch = kbl_char(r.trim()).map_err(|e| format!("{}:{}: {e}", f, n + 1))?;
-            k.entries.retain(|(s, _)| *s != sc);
-            k.entries.push((sc, ch));
+            let sc = parse_key(l).map_err(err)?;
+            let ch = kbl_char(r.trim().trim_end_matches(';')).map_err(err)?;
+            k.scan.retain(|(s, _)| *s != sc);
+            k.scan.push((sc, ch));
         }
-        if k.entries.is_empty() && k.cmap.is_empty() {
+        if k.keys.is_empty() && k.cmap.is_empty() && k.scan.is_empty() {
             return Err("no key mappings found in file".to_string());
         }
         unsafe {
@@ -1590,12 +1747,49 @@ impl Shell {
         Ok(())
     }
 
+    // expand a wildcard argument into matching "L:\path" strings
+    fn expand(&self, arg: &str) -> Result<Vec<String>, String> {
+        if !has_glob(arg) {
+            let (d, p) = self.resolve(arg);
+            return Ok(vec![format!("{}:{}", letter(d), p)]);
+        }
+        let pos = arg.rfind(|c| c == '\\' || c == '/').map(|i| i + 1).unwrap_or(0);
+        let (dirpart, pat) = arg.split_at(pos);
+        let (d, dp) = self.resolve(dirpart.trim_end_matches(|c| c == '\\' || c == '/'));
+        let ents = self.with_fs(d, |fs| {
+            let it = fs.read_dir(pb(&dp)?).map_err(es)?;
+            let mut v = Vec::new();
+            for e in it {
+                v.push(e.map_err(es)?);
+            }
+            Ok(v)
+        })?;
+        let mut out = Vec::new();
+        for e in &ents {
+            let name = format!("{}", e.file_name());
+            if name == "." || name == ".." {
+                continue;
+            }
+            if glob_match(pat, &name) {
+                out.push(format!("{}:{}", letter(d), joinp(&dp, &name)));
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     fn kbl_test(&self) {
         println!("kbl test - press keys to see what the firmware sends (Esc to exit)");
         loop {
             match getkey() {
                 Key::Printable(c) => {
-                    println!("  printable U+{:04X}  '{}'", u16::from(c) as u32, char::from(c))
+                    let raw = char::from(c);
+                    let t = kbl_translate(raw);
+                    if t != raw {
+                        println!("  printable U+{:04X}  '{}'  -> layout makes '{}'", u16::from(c) as u32, raw, t);
+                    } else {
+                        println!("  printable U+{:04X}  '{}'", u16::from(c) as u32, raw);
+                    }
                 }
                 Key::Special(s) => {
                     if s.0 == 0x17 {
@@ -1603,8 +1797,8 @@ impl Shell {
                         return;
                     }
                     let mapped = kbl_lookup(s.0)
-                    .map(|c| format!("  -> mapped to '{c}'"))
-                    .unwrap_or_default();
+                        .map(|c| format!("  -> mapped to '{c}'"))
+                        .unwrap_or_default();
                     println!("  scancode 0x{:02X} ({}){}", s.0, key_name(s.0), mapped);
                 }
             }
@@ -1615,17 +1809,18 @@ impl Shell {
         match rest.first().map(|s| s.as_str()) {
             None => {
                 wl!(io, "keyboard layout: {}", cur_kbl_name());
-                let (entries, cmap) = unsafe {
-                    match &*core::ptr::addr_of!(CUR_KBL) {
-                        Some(k) => (k.entries.clone(), k.cmap.clone()),
-                        None => (DEF_KBL.to_vec(), Vec::new()),
+                if let Some(k) = cur_kbl() {
+                    for (kid, lv) in &k.keys {
+                        let nm = KEY_NAMES.iter().find(|&(_, id)| id == kid).map(|(n, _)| *n).unwrap_or("?");
+                        let lv: Vec<String> = lv.iter().map(|c| c.map(|x| format!("'{x}'")).unwrap_or_else(|| "none".into())).collect();
+                        wl!(io, "  <{nm}>  [ {} ]", lv.join(", "));
                     }
-                };
-                for (sc, ch) in entries {
-                    wl!(io, "  {:<6} = {ch}", key_name(sc));
-                }
-                for (f, t) in cmap {
-                    wl!(io, "  '{f}'    -> '{t}'");
+                    for (f, t) in &k.cmap {
+                        wl!(io, "  remap '{f}' -> '{t}'");
+                    }
+                    for (sc, ch) in &k.scan {
+                        wl!(io, "  {:<6} = {ch}", key_name(sc));
+                    }
                 }
                 Ok(())
             }
@@ -1649,7 +1844,15 @@ impl Shell {
     }
 
     fn dir(&self, arg: &str, io: &mut Io) -> Result<(), String> {
-        let (d, p) = self.resolve(arg);
+        let (d, p, pat) = if has_glob(arg) {
+            let pos = arg.rfind(|c| c == '\\' || c == '/').map(|i| i + 1).unwrap_or(0);
+            let (dirpart, pat) = arg.split_at(pos);
+            let (d, dp) = self.resolve(dirpart.trim_end_matches(|c| c == '\\' || c == '/'));
+            (d, dp, Some(pat.to_string()))
+        } else {
+            let (d, p) = self.resolve(arg);
+            (d, p, None)
+        };
         let ents = self.with_fs(d, |fs| {
             let it = fs.read_dir(pb(&p)?).map_err(es)?;
             let mut v = Vec::new();
@@ -1664,6 +1867,11 @@ impl Shell {
             let name = format!("{}", e.file_name());
             if name == "." || name == ".." {
                 continue;
+            }
+            if let Some(pat) = &pat {
+                if !glob_match(pat, &name) {
+                    continue;
+                }
             }
             let t = e.modification_time();
             let isd = e.is_directory();
@@ -1697,11 +1905,17 @@ impl Shell {
 
     fn del(&self, rest: &[String]) -> Result<(), String> {
         if rest.is_empty() {
-            return Err("usage: del <file> [file...]".to_string());
+            return Err("usage: del <file> [file...]  (wildcards * ? ok)".to_string());
         }
         for f in rest {
-            let (d, p) = self.resolve(f);
-            self.with_fs(d, |fs| fs.remove_file(pb(&p)?).map_err(es))?;
+            for hit in self.expand(f)? {
+                let (d, p) = self.resolve(&hit);
+                let is_dir = self.with_fs(d, |fs| Ok(Self::is_dir(fs, &p)))?;
+                if is_dir {
+                    return Err(format!("{hit}: is a directory (use rd)"));
+                }
+                self.with_fs(d, |fs| fs.remove_file(pb(&p)?).map_err(es))?;
+            }
         }
         Ok(())
     }
@@ -1743,16 +1957,23 @@ impl Shell {
 
     fn copy(&self, rest: &[String], io: &mut Io) -> Result<(), String> {
         if rest.len() != 2 {
-            return Err("usage: copy <src> <dst>".to_string());
+            return Err("usage: copy <src> <dst>   (wildcards ok in src; multiple hits need dst dir)".to_string());
         }
-        let (sd, sp) = self.resolve(&rest[0]);
+        let hits = self.expand(&rest[0])?;
         let (dd, dp) = self.resolve(&rest[1]);
-        let data = self.with_fs(sd, |fs| fs.read(pb(&sp)?).map_err(es))?;
         let dst_is_dir = self.with_fs(dd, |fs| Ok(Self::is_dir(fs, &dp)))?;
-        let ddp = if dst_is_dir { joinp(&dp, base(&sp)) } else { dp };
-        let n = data.len();
-        self.with_fs(dd, |fs| fs.write(pb(&ddp)?, data).map_err(es))?;
-        wl!(io, "copied {n} bytes -> {}:{}", letter(dd), ddp);
+        if hits.len() > 1 && !dst_is_dir {
+            return Err("copying multiple files needs a directory as dst".to_string());
+        }
+        let mut total = 0u64;
+        for hit in &hits {
+            let (sd, sp) = self.resolve(hit);
+            let data = self.with_fs(sd, |fs| fs.read(pb(&sp)?).map_err(es))?;
+            let ddp = if dst_is_dir { joinp(&dp, base(&sp)) } else { dp.clone() };
+            total += data.len() as u64;
+            self.with_fs(dd, |fs| fs.write(pb(&ddp)?, data).map_err(es))?;
+        }
+        wl!(io, "copied {} file(s), {} -> {}:{}", hits.len(), human(total), letter(dd), dp);
         Ok(())
     }
 
@@ -1803,13 +2024,21 @@ impl Shell {
         if args.len() != 2 {
             return Err("usage: xcopy <src> <dst> [/e]   (recursive; /e copies empty dirs too)".to_string());
         }
-        let (sd, sp) = self.resolve(args[0]);
         let (dd, dp) = self.resolve(args[1]);
         let dst_is_dir = self.with_fs(dd, |fs| Ok(Self::is_dir(fs, &dp)))?;
-        let ddp = if dst_is_dir { joinp(&dp, base(&sp)) } else { dp };
+        let hits = self.expand(args[0])?;
+        if hits.is_empty() {
+            return Err(format!("{}: no match", args[0]));
+        }
         let (mut nf, mut nb) = (0u64, 0u64);
-        self.xcopy_tree(sd, &sp, dd, &ddp, empty, &mut nf, &mut nb)?;
-        wl!(io, "copied {nf} file(s), {} -> {}:{}", human(nb), letter(dd), ddp);
+        let mut last_dst = dp.clone();
+        for hit in &hits {
+            let (sd, sp) = self.resolve(hit);
+            let ddp = if dst_is_dir { joinp(&dp, base(&sp)) } else { dp.clone() };
+            self.xcopy_tree(sd, &sp, dd, &ddp, empty, &mut nf, &mut nb)?;
+            last_dst = ddp;
+        }
+        wl!(io, "copied {nf} file(s), {} -> {}:{}", human(nb), letter(dd), last_dst);
         Ok(())
     }
 
@@ -1830,6 +2059,19 @@ impl Shell {
     fn move_cmd(&self, rest: &[String], io: &mut Io) -> Result<(), String> {
         if rest.len() != 2 {
             return Err("usage: move <src> <dst>".to_string());
+        }
+        if has_glob(&rest[0]) {
+            let hits = self.expand(&rest[0])?;
+            let (dd, dp) = self.resolve(&rest[1]);
+            let dst_is_dir = self.with_fs(dd, |fs| Ok(Self::is_dir(fs, &dp)))?;
+            if !dst_is_dir {
+                return Err("moving multiple files needs a directory as dst".to_string());
+            }
+            for hit in &hits {
+                self.copy(&[hit.clone(), rest[1].clone()], io)?;
+                self.del(&[hit.clone()])?;
+            }
+            return Ok(());
         }
         let (sd, sp) = self.resolve(&rest[0]);
         let (dd, dp) = self.resolve(&rest[1]);
@@ -1912,9 +2154,11 @@ impl Shell {
             io.put(&d);
         } else {
             for f in rest {
-                let d = self.read_file(f).map_err(|e| format!("{f}: {e}"))?;
-                last_nl = d.last().map_or(true, |&b| b == b'\n');
-                io.put(&d);
+                for hit in self.expand(f).map_err(|e| format!("{f}: {e}"))? {
+                    let d = self.read_file(&hit).map_err(|e| format!("{hit}: {e}"))?;
+                    last_nl = d.last().map_or(true, |&b| b == b'\n');
+                    io.put(&d);
+                }
             }
         }
         if io.direct && !last_nl {
@@ -1947,7 +2191,9 @@ impl Shell {
             srcs.push(io.take_input());
         } else {
             for f in &files {
-                srcs.push(self.read_file(f).map_err(|e| format!("{f}: {e}"))?);
+                for hit in self.expand(f).map_err(|e| format!("{f}: {e}"))? {
+                    srcs.push(self.read_file(&hit).map_err(|e| format!("{hit}: {e}"))?);
+                }
             }
         }
         for d in srcs {
@@ -1962,6 +2208,34 @@ impl Shell {
         Ok(())
     }
 
+    fn run_bat(&mut self, d: usize, p: &str, io: &mut Io) -> Result<(), String> {
+        if self.bat_depth >= 8 {
+            return Err("batch files nested too deep".to_string());
+        }
+        let data = self.with_fs(d, |fs| fs.read(pb(p)?).map_err(es))?;
+        let text = String::from_utf8_lossy(&data);
+        self.bat_depth += 1;
+        for raw in text.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with("::") {
+                continue;
+            }
+            let low = line.to_ascii_lowercase();
+            if low == "rem" || low.starts_with("rem ") {
+                continue;
+            }
+            if io.direct {
+                println!("C:\\> {line}");
+            }
+            self.run_line(line);
+            if self.quit {
+                break;
+            }
+        }
+        self.bat_depth -= 1;
+        Ok(())
+    }
+
     fn locate(&self, name: &str) -> Option<(usize, String)> {
         let (d, p) = self.resolve(name);
         let last = name.rsplit(|c| c == '\\' || c == '/').next().unwrap_or("");
@@ -1973,6 +2247,7 @@ impl Shell {
             } else {
                 cands.push((d, format!("{p}.com")));
                 cands.push((d, format!("{p}.efi")));
+                cands.push((d, format!("{p}.bat")));
             }
         };
         add(d, p);
@@ -1987,15 +2262,19 @@ impl Shell {
         None
     }
 
-    fn start(&self, a: &[String], io: &mut Io) -> Result<(), String> {
-        let name = a.first().ok_or("usage: start <file.com|file.efi> [args]")?;
+    fn start(&mut self, a: &[String], io: &mut Io) -> Result<(), String> {
+        let name = a.first().ok_or("usage: start <file.com|file.efi|file.bat> [args]")?;
         let (d, p) = self.locate(name).ok_or_else(|| format!("{name}: not found"))?;
-        let data = self.with_fs(d, |fs| fs.read(pb(&p)?).map_err(es))?;
         let ext = p.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+        match ext.as_str() {
+            "bat" => return self.run_bat(d, &p, io),
+            "com" | "efi" => {}
+            _ => return Err("unsupported file type (use .com, .efi or .bat)".to_string()),
+        }
+        let data = self.with_fs(d, |fs| fs.read(pb(&p)?).map_err(es))?;
         let rc = match ext.as_str() {
             "com" => run_com(&data, &a[1..].join(" "), io)?,
-            "efi" => run_efi(&data, &a.join(" "))?,
-            _ => return Err("unsupported binary type (use .com or .efi)".to_string()),
+            _ => run_efi(&data, &a.join(" "))?,
         };
         if rc != 0 {
             println!("[exit {rc}]");
@@ -2049,22 +2328,23 @@ impl Shell {
                 Ok(())
             }
             "help" | "?" => {
-                wl!(io, "dir [path]              list directory");
+                wl!(io, "dir [path|pattern]      list directory (wildcards *.* *.txt ...)");
                 wl!(io, "cd [path]               change directory (L: switches drive)");
-                wl!(io, "del <file>...           delete files");
+                wl!(io, "del <file>...           delete files (wildcards * ? ok)");
                 wl!(io, "md <dir>                create directory");
                 wl!(io, "rd [/s] <dir>           remove directory (/s recursive)");
-                wl!(io, "copy <src> <dst>        copy a file (cross-volume ok)");
+                wl!(io, "copy <src> <dst>        copy file(s); wildcards ok, dst dir for many");
                 wl!(io, "xcopy <src> <dst> [/e]  copy directories recursively (/e keeps empty dirs)");
                 wl!(io, "ren <old> <new>         rename (same drive)");
                 wl!(io, "move <src> <dst>        move file/dir (rename, or copy+delete cross-volume)");
                 wl!(io, "echo [text]             print text");
-                wl!(io, "type [file...]          print files (or stdin)");
+                wl!(io, "type [file...]          print files (wildcards ok) or stdin");
                 wl!(io, "find [/i] [/v] <txt> [file...]   filter lines");
-                wl!(io, "start <prog> [args]     run .com (64-bit flat) / .efi; bare names work too");
+                wl!(io, "start <prog> [args]     run .com (64-bit flat) / .efi / .bat script;");
+                wl!(io, "                        bare names work too");
                 wl!(io, "edit [file]             nano-like editor (alias: nano, notepad)");
-                wl!(io, "kbl [file]              load keyboard layout; 'kbl default' resets;");
-                wl!(io, "                        'kbl test' shows what each key sends");
+                wl!(io, "kbl [file]              load xkb-style keyboard layout;");
+                wl!(io, "                        'kbl default' resets, 'kbl test' shows key codes");
                 wl!(io, "                        (\\EFICOMMAND.kbl auto-loads from boot drive)");
                 wl!(io, "mount                   rescan + list; mount fsN L: ; mount -d L:");
                 wl!(io, "disk-list               list block devices");
@@ -2172,7 +2452,7 @@ fn main() -> Status {
     uefi::helpers::init().unwrap();
     let _ = boot::set_watchdog_timer(0, 0x10000, None);
     cls();
-    println!("EFICOMMAND v0.4 - type 'help'\n");
+    println!("EFICOMMAND v0.5 - type 'help'\n");
     let mut sh = Shell::new();
     for cand in ["EFICOMMAND.kbl", "kbl.kbl"] {
         let p = format!("{}:\\{}", letter(sh.boot), cand);
@@ -2188,3 +2468,8 @@ fn main() -> Status {
     }
     Status::SUCCESS
 }
+
+
+
+
+
