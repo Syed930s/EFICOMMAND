@@ -1,4 +1,4 @@
-// Colemak (US)
+// Colemak (US, ANSI laptop). All symbols are reachable, no F-row layer needed.
 name = "Colemak"
 key <AD03> { [ f, F ] };
 key <AD04> { [ p, P ] };
